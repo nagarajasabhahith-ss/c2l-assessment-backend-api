@@ -236,17 +236,17 @@ class ReportService:
         """
         objects = list(assessment.objects)
         tree = self.get_containment_tree(assessment)
+        relationships = list(assessment.relationships)
         report: dict[str, Any] = {
             "assessment_id": str(assessment.id),
             "sections": {},
         }
         report["sections"]["visualization_details"] = self._get_visualization_details(
-            objects, tree
+            objects, tree, relationships
         )
         report["sections"]["dashboards_breakdown"] = self._get_dashboards_breakdown(
             objects, tree
         )
-        relationships = list(assessment.relationships)
         report["sections"]["reports_breakdown"] = self._get_reports_breakdown(
             objects, tree, relationships
         )
@@ -256,8 +256,12 @@ class ReportService:
         report["sections"]["data_source_connections_breakdown"] = (
             self._get_data_source_connections_breakdown(objects, tree, relationships)
         )
-        report["sections"]["calculated_fields_breakdown"] = self._get_calculated_fields_breakdown(objects)
-        report["sections"]["filters_breakdown"] = self._get_filters_breakdown(objects, tree)
+        report["sections"]["calculated_fields_breakdown"] = self._get_calculated_fields_breakdown(
+            objects, tree, relationships
+        )
+        report["sections"]["filters_breakdown"] = self._get_filters_breakdown(
+            objects, tree, relationships
+        )
         report["sections"]["parameters_breakdown"] = self._get_parameters_breakdown(objects)
         report["sections"]["sorts_breakdown"] = self._get_sorts_breakdown(objects)
         report["sections"]["prompts_breakdown"] = self._get_prompts_breakdown(objects)
@@ -271,6 +275,57 @@ class ReportService:
         report["sections"]["dimensions_breakdown"] = self._get_dimensions_breakdown(
             objects, tree, relationships
         )
+
+        vd = report["sections"]["visualization_details"]
+        by_complexity = vd.get("by_complexity") or {}
+        cf_breakdown = report["sections"].get("calculated_fields_breakdown") or {}
+        by_cf = cf_breakdown.get("by_complexity") or {}
+        filters_breakdown = report["sections"].get("filters_breakdown") or {}
+        by_filter = filters_breakdown.get("by_complexity") or {}
+        report["complex_analysis"] = {
+            "visualization": [
+                {
+                    "complexity": level,
+                    "visualization_count": by_complexity.get(level, {}).get("visualization_count", 0),
+                    "dashboards_containing_count": by_complexity.get(level, {}).get("dashboards_containing_count", 0),
+                    "reports_containing_count": by_complexity.get(level, {}).get("reports_containing_count", 0),
+                }
+                for level in ("low", "medium", "high", "critical")
+            ],
+            "dashboard": [
+                {
+                    "complexity": level,
+                    "dashboards_containing_count": by_complexity.get(level, {}).get("dashboards_containing_count", 0),
+                }
+                for level in ("low", "medium", "high", "critical")
+            ],
+            "report": [
+                {
+                    "complexity": level,
+                    "reports_containing_count": by_complexity.get(level, {}).get("reports_containing_count", 0),
+                }
+                for level in ("low", "medium", "high", "critical")
+            ],
+            "calculated_field": [
+                {
+                    "complexity": level,
+                    "calculated_field_count": by_cf.get(level, {}).get("calculated_field_count", 0),
+                    "dashboards_containing_count": by_cf.get(level, {}).get("dashboards_containing_count", 0),
+                    "reports_containing_count": by_cf.get(level, {}).get("reports_containing_count", 0),
+                }
+                for level in ("low", "medium", "high", "critical")
+            ],
+            "filter": [
+                {
+                    "complexity": level,
+                    "filter_count": by_filter.get(level, {}).get("filter_count", 0),
+                    "dashboards_containing_count": by_filter.get(level, {}).get("dashboards_containing_count", 0),
+                    "reports_containing_count": by_filter.get(level, {}).get("reports_containing_count", 0),
+                }
+                for level in ("low", "medium", "high", "critical")
+            ],
+        }
+
         return report
 
     def _file_to_container_type(
@@ -293,21 +348,78 @@ class ReportService:
                 result[fid] = "report"
         return result
 
+    def _resolve_containment_root(
+        self,
+        obj: ExtractedObject,
+        tree: ContainmentTree,
+        file_container: dict[Any, str],
+        relationships_by_target: dict[Any, list[Any]],
+    ) -> tuple[int, int, Any, Any]:
+        """
+        Resolve dashboard/report containment for an object.
+        Returns (dashboards_containing_count, reports_containing_count, dash_root_key, report_root_key).
+        Counts are 0 or 1; root keys are used for distinct aggregation (or None).
+        Tries: (1) tree.get_root(obj.id), (2) get_root of any object that references this one (relationship target), (3) file_container fallback.
+        """
+        root_id, root_kind = tree.get_root(obj.id)
+        if root_kind == "dashboard" and root_id is not None:
+            return (1, 0, root_id, None)
+        if root_kind == "report" and root_id is not None:
+            return (0, 1, None, root_id)
+        # Fallback: any relationship where this object is target — use source's root
+        for key in (obj.id, str(obj.id)):
+            for src_id in relationships_by_target.get(key, []):
+                rid, rkind = tree.get_root(src_id)
+                if rkind == "dashboard" and rid is not None:
+                    return (1, 0, rid, None)
+                if rkind == "report" and rid is not None:
+                    return (0, 1, None, rid)
+        # File fallback
+        container = file_container.get(obj.file_id)
+        if container == "dashboard":
+            return (1, 0, ("file", obj.file_id), None)
+        if container == "report":
+            return (0, 1, None, ("file", obj.file_id))
+        return (0, 0, None, None)
+
     def _get_visualization_details(
         self,
         objects: list[ExtractedObject],
         tree: ContainmentTree,
+        relationships: Optional[list[ObjectRelationship]] = None,
     ) -> dict[str, Any]:
         """
         Aggregate visualization counts using containment tree: total and per-type
         count, plus how many distinct dashboards and reports contain each type.
         Resolves root by traversing CONTAINS/PARENT_CHILD upward; falls back to
         file-based container when tree root is missing.
+        When relationships are provided, also counts distinct queries used by each
+        viz type (USES/REFERENCES from visualization to query); parser links viz→query
+        via USES, not CONTAINS, so containment walk-up would not find queries.
         """
         file_container = self._file_to_container_type(objects)
         viz_to_count_and_containers: dict[str, tuple[int, set[Any], set[Any]]] = defaultdict(
             lambda: (0, set(), set())
         )
+        viz_to_queries: dict[str, set[Any]] = defaultdict(set)
+        id_to_obj = tree.id_to_obj
+        # From relationships: viz → query (USES/REFERENCES) so we count queries used by each viz type
+        if relationships:
+            for rel in relationships:
+                rt = _normalize_rel_type(rel.relationship_type)
+                if rt not in USAGE_REL_TYPES:
+                    continue
+                src, tgt = rel.source_object_id, rel.target_object_id
+                if src not in id_to_obj or tgt not in id_to_obj:
+                    continue
+                src_obj = id_to_obj[src]
+                tgt_obj = id_to_obj[tgt]
+                if not self._is_visualization_object(src_obj):
+                    continue
+                if _normalize_object_type(tgt_obj.object_type) != "query":
+                    continue
+                viz_type = self._get_visualization_type_for_object(src_obj)
+                viz_to_queries[viz_type].add(tgt)
         for obj in objects:
             if not self._is_visualization_object(obj):
                 continue
@@ -326,9 +438,14 @@ class ReportService:
                     dash_roots.add(("file", obj.file_id))
                 elif container == "report":
                     report_roots.add(("file", obj.file_id))
+            # Query count is already filled from USES/REFERENCES (viz→query) above; containment
+            # walk-up would not find query because parser links report→viz (CONTAINS) and viz→query (USES).
             viz_to_count_and_containers[viz_type] = (count, dash_roots, report_roots)
         total = sum(t[0] for t in viz_to_count_and_containers.values())
         viz_complexity_lookup = self._get_visualization_complexity_lookup()
+        # Per-complexity: union of dashboard/report roots that contain at least one viz of that complexity
+        complexity_to_dash_roots: dict[str, set[Any]] = defaultdict(set)
+        complexity_to_report_roots: dict[str, set[Any]] = defaultdict(set)
         breakdown = []
         for viz, (count, dash_roots, report_roots) in sorted(
             viz_to_count_and_containers.items(), key=lambda x: -x[1][0]
@@ -336,6 +453,10 @@ class ReportService:
             key = (viz or "").strip().lower()
             info = viz_complexity_lookup.get(key) or {}
             complexity = (info.get("complexity") if info else None) or "Unknown"
+            c_key = (complexity or "").strip().lower()
+            if c_key in ("low", "medium", "high", "critical"):
+                complexity_to_dash_roots[c_key].update(dash_roots)
+                complexity_to_report_roots[c_key].update(report_roots)
             breakdown.append({
                 "visualization": viz,
                 "count": count,
@@ -345,6 +466,7 @@ class ReportService:
                 "recommended": info.get("recommended"),
                 "dashboards_containing_count": len(dash_roots),
                 "reports_containing_count": len(report_roots),
+                "queries_using_count": len(viz_to_queries.get(viz, set())),
             })
         # Aggregate counts by complexity (low, medium, high, critical)
         stats: dict[str, int] = {"low": 0, "medium": 0, "high": 0, "critical": 0}
@@ -360,11 +482,20 @@ class ReportService:
             elif c == "critical":
                 stats["critical"] += cnt
         overall_complexity = None
+        # By complexity: visualization count and distinct dashboards/reports containing that complexity
+        by_complexity: dict[str, dict[str, Any]] = {}
+        for level in ("low", "medium", "high", "critical"):
+            by_complexity[level] = {
+                "visualization_count": stats.get(level, 0),
+                "dashboards_containing_count": len(complexity_to_dash_roots.get(level, set())),
+                "reports_containing_count": len(complexity_to_report_roots.get(level, set())),
+            }
 
         return {
             "total_visualization": total,
             "overall_complexity": overall_complexity,
             "stats": stats,
+            "by_complexity": by_complexity,
             "breakdown": breakdown,
         }
 
@@ -543,6 +674,28 @@ class ReportService:
             if ot == "report":
                 report_to_ids[oid].add(oid)
 
+        # Relationship fallback: objects not in CONTAINS chain (e.g. filters/calculated fields
+        # linked via REFERENCES/USES) — resolve report root via any object that references this one.
+        relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
+        for rel in relationships:
+            tgt = rel.target_object_id
+            relationships_by_target[tgt].append(rel.source_object_id)
+            if str(tgt) != tgt:
+                relationships_by_target[str(tgt)] = relationships_by_target[tgt]
+        obj_ids_in_reports = {oid for member_ids in report_to_ids.values() for oid in member_ids}
+        for obj in objects:
+            if obj.id in obj_ids_in_reports:
+                continue
+            for key in (obj.id, str(obj.id)):
+                for src_id in relationships_by_target.get(key, []):
+                    root_id, root_kind = tree.get_root(src_id)
+                    if root_kind == "report" and root_id is not None:
+                        report_to_ids[root_id].add(obj.id)
+                        obj_ids_in_reports.add(obj.id)
+                        break
+                if obj.id in obj_ids_in_reports:
+                    break
+
         # Data modules, packages, data sources: distinct counts via (1) bottom-to-top usage,
         # (2) top-down usage from report (nested: report→query→data_module), (3) containment.
         report_to_data_modules: dict[Any, set[Any]] = defaultdict(set)
@@ -647,6 +800,19 @@ class ReportService:
                     counts["prompts"] += 1
                 elif ot == "calculated_field":
                     counts["calculated_fields"] += 1
+                    props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+                    calc_type = (self._get_prop_any_case(props, "calculation_type") or "").strip() or "expression"
+                    expr_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
+                    cf_complexity = self._calculated_field_complexity(calc_type, expr_raw)
+                    cf_c = (cf_complexity or "").strip().lower()
+                    if cf_c == "low":
+                        counts["calculated_fields_low"] += 1
+                    elif cf_c == "medium":
+                        counts["calculated_fields_medium"] += 1
+                    elif cf_c == "high":
+                        counts["calculated_fields_high"] += 1
+                    elif cf_c == "critical":
+                        counts["calculated_fields_critical"] += 1
                 elif ot == "measure":
                     counts["measures"] += 1
                 elif ot == "dimension":
@@ -668,8 +834,17 @@ class ReportService:
                 "high": counts["visualizations_high"],
                 "critical": counts["visualizations_critical"],
             }
-            # Report complexity = worst level present (critical > high > medium > low)
-            if viz_by_complexity["critical"] > 0:
+            calculated_fields_by_complexity = {
+                "low": counts["calculated_fields_low"],
+                "medium": counts["calculated_fields_medium"],
+                "high": counts["calculated_fields_high"],
+                "critical": counts["calculated_fields_critical"],
+            }
+
+            # Report complexity: interactiveReport → Critical; else worst level present (critical > high > medium > low)
+            if (report_type or "").strip().lower() == "interactivereport":
+                report_complexity = "Critical"
+            elif viz_by_complexity["critical"] > 0:
                 report_complexity = "Critical"
             elif viz_by_complexity["high"] > 0:
                 report_complexity = "High"
@@ -679,6 +854,8 @@ class ReportService:
                 report_complexity = "Low"
             else:
                 report_complexity = "Unknown"
+
+
             reports_list.append({
                 "report_id": str(report_id),
                 "report_name": name,
@@ -686,6 +863,7 @@ class ReportService:
                 "complexity": report_complexity,
                 "total_visualizations": counts["visualizations"],
                 "visualizations_by_complexity": viz_by_complexity,
+                "calculated_fields_by_complexity": calculated_fields_by_complexity,
                 "total_pages": counts["pages"],
                 "total_data_modules": len(report_to_data_modules.get(report_id, set())),
                 "total_packages": len(report_to_packages.get(report_id, set())),
@@ -1089,9 +1267,32 @@ class ReportService:
         # Default (arithmetic or plain expression) → Low
         return "Low"
 
-    def _get_calculated_fields_breakdown(self, objects: list[ExtractedObject]) -> dict[str, Any]:
-        """Total calculated fields and per-field details (expression, type, etc.)."""
+    def _get_calculated_fields_breakdown(
+        self,
+        objects: list[ExtractedObject],
+        tree: Optional[ContainmentTree] = None,
+        relationships: Optional[list[ObjectRelationship]] = None,
+    ) -> dict[str, Any]:
+        """Total calculated fields and per-field details (expression, type, etc.).
+        When tree is provided, adds dashboards_containing_count and reports_containing_count
+        per field (0 or 1 from containment root; fallback via relationships or file when root is missing).
+        Also builds by_complexity: per-level count of calculated fields and distinct
+        dashboards/reports containing that complexity (for complex_analysis.calculated_field).
+        """
         items: list[dict[str, Any]] = []
+        file_container: dict[Any, str] = {}
+        complexity_to_count: dict[str, int] = defaultdict(int)
+        complexity_to_dash_roots: dict[str, set[Any]] = defaultdict(set)
+        complexity_to_report_roots: dict[str, set[Any]] = defaultdict(set)
+        relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
+        if tree is not None:
+            file_container = self._file_to_container_type(objects)
+            if relationships:
+                for rel in relationships:
+                    tgt = rel.target_object_id
+                    relationships_by_target[tgt].append(rel.source_object_id)
+                    if str(tgt) != tgt:
+                        relationships_by_target[str(tgt)] = relationships_by_target[tgt]
         for obj in objects:
             if _normalize_object_type(obj.object_type) != "calculated_field":
                 continue
@@ -1100,27 +1301,79 @@ class ReportService:
             calculation_type = (self._get_prop_any_case(props, "calculation_type") or "").strip() or "expression"
             expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
             complexity = self._calculated_field_complexity(calculation_type, expression_raw)
+            c_key = (complexity or "").strip().lower()
+            if c_key in ("low", "medium", "high", "critical"):
+                complexity_to_count[c_key] += 1
+
+            dashboards_containing_count = 0
+            reports_containing_count = 0
+            dash_root_key: Any = None
+            report_root_key: Any = None
+            if tree is not None:
+                dashboards_containing_count, reports_containing_count, dash_root_key, report_root_key = (
+                    self._resolve_containment_root(
+                        obj, tree, file_container, relationships_by_target
+                    )
+                )
+                if c_key in ("low", "medium", "high", "critical"):
+                    if dash_root_key is not None:
+                        complexity_to_dash_roots[c_key].add(dash_root_key)
+                    if report_root_key is not None:
+                        complexity_to_report_roots[c_key].add(report_root_key)
+
             items.append({
                 "calculated_field_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed>",
                 **extra,
                 "complexity": complexity,
+                "dashboards_containing_count": dashboards_containing_count,
+                "reports_containing_count": reports_containing_count,
             })
-        return {"total_calculated_fields": len(items), "calculated_fields": items}
+        by_complexity: dict[str, dict[str, Any]] = {
+            level: {
+                "complexity": level,
+                "calculated_field_count": complexity_to_count.get(level, 0),
+                "dashboards_containing_count": len(complexity_to_dash_roots.get(level, set())),
+                "reports_containing_count": len(complexity_to_report_roots.get(level, set())),
+            }
+            for level in ("low", "medium", "high", "critical")
+        }
+        return {
+            "total_calculated_fields": len(items),
+            "calculated_fields": items,
+            "by_complexity": by_complexity,
+        }
 
     def _get_filters_breakdown(
         self,
         objects: list[ExtractedObject],
         tree: Optional[ContainmentTree] = None,
+        relationships: Optional[list[ObjectRelationship]] = None,
     ) -> dict[str, Any]:
         """
         Total filters and per-filter details.
         Includes: expression, filter_type (detail/summary), filter_scope (query_level/report_level/data_module/data_set),
         filter_style (expression/definition), is_simple/is_complex, ref_data_item, filter_definition_summary,
         postAutoAggregation, referenced_columns, parameter_references.
-        When tree is provided, resolves parent_id to parent_name (report or query the filter is associated with).
+        When tree is provided, resolves parent_id to parent_name (report or query the filter is associated with),
+        and adds dashboards_containing_count and reports_containing_count per filter (0 or 1 from containment root).
+        Uses relationship fallback when filter is not in CONTAINS chain (e.g. linked via references/uses).
+        Also builds by_complexity: per-level filter count and distinct dashboards/reports containing that complexity (for complex_analysis.filter).
         """
         id_to_obj = tree.id_to_obj if tree else {}
+        file_container: dict[Any, str] = {}
+        relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
+        complexity_to_count: dict[str, int] = defaultdict(int)
+        complexity_to_dash_roots: dict[str, set[Any]] = defaultdict(set)
+        complexity_to_report_roots: dict[str, set[Any]] = defaultdict(set)
+        if tree is not None:
+            file_container = self._file_to_container_type(objects)
+            if relationships:
+                for rel in relationships:
+                    tgt = rel.target_object_id
+                    relationships_by_target[tgt].append(rel.source_object_id)
+                    if str(tgt) != tgt:
+                        relationships_by_target[str(tgt)] = relationships_by_target[tgt]
         items: list[dict[str, Any]] = []
         for obj in objects:
             if _normalize_object_type(obj.object_type) != "filter":
@@ -1137,11 +1390,33 @@ class ReportService:
             )
             is_complex = props.get("is_complex") is True
             complexity = "Medium" if is_complex else "Low"
+            c_key = (complexity or "").strip().lower()
+            if c_key in ("low", "medium", "high", "critical"):
+                complexity_to_count[c_key] += 1
+
+            dashboards_containing_count = 0
+            reports_containing_count = 0
+            dash_root_key: Any = None
+            report_root_key: Any = None
+            if tree is not None:
+                dashboards_containing_count, reports_containing_count, dash_root_key, report_root_key = (
+                    self._resolve_containment_root(
+                        obj, tree, file_container, relationships_by_target
+                    )
+                )
+                if c_key in ("low", "medium", "high", "critical"):
+                    if dash_root_key is not None:
+                        complexity_to_dash_roots[c_key].add(dash_root_key)
+                    if report_root_key is not None:
+                        complexity_to_report_roots[c_key].add(report_root_key)
+
             item: dict[str, Any] = {
                 "filter_id": str(obj.id),
                 "complexity": complexity,
                 "name": (obj.name or "").strip() or "<unnamed>",
                 **extra,
+                "dashboards_containing_count": dashboards_containing_count,
+                "reports_containing_count": reports_containing_count,
             }
             parent_id = props.get("parent_id") or getattr(obj, "parent_id", None)
             if parent_id and id_to_obj:
@@ -1161,7 +1436,16 @@ class ReportService:
             elif c == "medium": _stats["medium"] += 1
             elif c == "high": _stats["high"] += 1
             elif c == "critical": _stats["critical"] += 1
-        return {"total_filters": len(items), "stats": _stats, "filters": items}
+        by_complexity: dict[str, dict[str, Any]] = {
+            level: {
+                "complexity": level,
+                "filter_count": complexity_to_count.get(level, 0),
+                "dashboards_containing_count": len(complexity_to_dash_roots.get(level, set())),
+                "reports_containing_count": len(complexity_to_report_roots.get(level, set())),
+            }
+            for level in ("low", "medium", "high", "critical")
+        }
+        return {"total_filters": len(items), "stats": _stats, "filters": items, "by_complexity": by_complexity}
 
     def _get_parameters_breakdown(self, objects: list[ExtractedObject]) -> dict[str, Any]:
         """Total parameters and per-parameter details (type, etc.)."""

@@ -9,6 +9,8 @@ class VisualizationBreakdownItem(BaseModel):
     complexity: str = "Unknown"
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Count of distinct queries that contain/use this visualization type."""
+    queries_using_count: int = 0
 
 
 class VisualizationComplexityStats(BaseModel):
@@ -19,9 +21,46 @@ class VisualizationComplexityStats(BaseModel):
     critical: int = 0
 
 
+class VisualizationByComplexityItem(BaseModel):
+    """Per-complexity: visualization count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"  # low | medium | high | critical
+    visualization_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
+
+
+class DashboardByComplexityItem(BaseModel):
+    """Per-complexity: distinct dashboards containing that complexity."""
+    complexity: str = "low"  # low | medium | high | critical
+    dashboards_containing_count: int = 0
+
+
+class ReportByComplexityItem(BaseModel):
+    """Per-complexity: distinct reports containing that complexity."""
+    complexity: str = "low"  # low | medium | high | critical
+    reports_containing_count: int = 0
+
+
+class CalculatedFieldByComplexityItem(BaseModel):
+    """Per-complexity: calculated field count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"  # low | medium | high | critical
+    calculated_field_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
+
+
+class FilterByComplexityItem(BaseModel):
+    """Per-complexity: filter count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"  # low | medium | high | critical
+    filter_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
+
+
 class VisualizationDetails(BaseModel):
     total_visualization: int
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
+    by_complexity: Dict[str, VisualizationByComplexityItem] = Field(default_factory=dict)
     breakdown: list[VisualizationBreakdownItem]
 
 
@@ -54,10 +93,14 @@ class ReportBreakdownItem(BaseModel):
     report_id: str
     report_name: str
     report_type: str = "report"  # report, interactiveReport, reportView, dataSet2, reportVersion
-    """Derived from visualizations_by_complexity: worst level present (Critical > High > Medium > Low)."""
+    """Derived from visualizations_by_complexity: worst level present (Critical > High > Medium > Low). Not affected by calculated_fields_by_complexity."""
     complexity: str = "Unknown"
     total_visualizations: int = 0
     visualizations_by_complexity: VisualizationComplexityStats = Field(
+        default_factory=lambda: VisualizationComplexityStats()
+    )
+    """Counts of calculated fields in this report by complexity (informational only; does not affect report complexity)."""
+    calculated_fields_by_complexity: VisualizationComplexityStats = Field(
         default_factory=lambda: VisualizationComplexityStats()
     )
     total_pages: int = 0
@@ -135,6 +178,10 @@ class CalculatedFieldBreakdownItem(BaseModel):
     expression: Optional[str] = None
     calculation_type: Optional[str] = None
     cognos_class: Optional[str] = None
+    """Count of dashboards containing this calculated field (0 or 1 per containment root)."""
+    dashboards_containing_count: int = 0
+    """Count of reports containing this calculated field (0 or 1 per containment root)."""
+    reports_containing_count: int = 0
     class Config:
         extra = "allow"
 
@@ -142,6 +189,8 @@ class CalculatedFieldBreakdownItem(BaseModel):
 class CalculatedFieldsBreakdown(BaseModel):
     total_calculated_fields: int
     calculated_fields: list[CalculatedFieldBreakdownItem]
+    """Per-complexity: calculated field count and distinct dashboards/reports containing that complexity (for complex_analysis.calculated_field)."""
+    by_complexity: Dict[str, CalculatedFieldByComplexityItem] = Field(default_factory=dict)
 
 
 class FilterBreakdownItem(BaseModel):
@@ -161,6 +210,10 @@ class FilterBreakdownItem(BaseModel):
     parent_id: Optional[str] = None
     parent_name: Optional[str] = None
     associated_container_type: Optional[str] = None  # report, query, data_module
+    """Count of dashboards containing this filter (0 or 1 per containment root)."""
+    dashboards_containing_count: int = 0
+    """Count of reports containing this filter (0 or 1 per containment root)."""
+    reports_containing_count: int = 0
     referenced_columns: Optional[List[str]] = None
     parameter_references: Optional[List[str]] = None
     cognos_class: Optional[str] = None
@@ -172,6 +225,8 @@ class FiltersBreakdown(BaseModel):
     total_filters: int
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     filters: list[FilterBreakdownItem]
+    """Per-complexity: filter count and distinct dashboards/reports containing that complexity (for complex_analysis.filter)."""
+    by_complexity: Dict[str, FilterByComplexityItem] = Field(default_factory=dict)
 
 
 class ParameterBreakdownItem(BaseModel):
@@ -346,6 +401,16 @@ class ReportSections(BaseModel):
     dimensions_breakdown: DimensionsBreakdown
 
 
+class ComplexAnalysis(BaseModel):
+    """Array of per-complexity stats: visualization count and dashboards/reports containing that complexity."""
+    visualization: List[VisualizationByComplexityItem] = Field(default_factory=list)
+    dashboard: List[DashboardByComplexityItem] = Field(default_factory=list)
+    report: List[ReportByComplexityItem] = Field(default_factory=list)
+    calculated_field: List[CalculatedFieldByComplexityItem] = Field(default_factory=list)
+    filter: List[FilterByComplexityItem] = Field(default_factory=list)
+
+
 class AssessmentReportResponse(BaseModel):
     assessment_id: str
     sections: ReportSections
+    complex_analysis: ComplexAnalysis = Field(default_factory=lambda: ComplexAnalysis())
