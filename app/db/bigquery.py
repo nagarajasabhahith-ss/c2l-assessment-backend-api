@@ -11,17 +11,26 @@ from typing import Generator, Optional
 
 from app.config import settings
 from google.cloud import bigquery
+from google.oauth2 import service_account
+
+# BigQuery-only scope to avoid 403 "getting Drive credentials" when SA has no Drive access
+BIGQUERY_SCOPE = ["https://www.googleapis.com/auth/bigquery", "https://www.googleapis.com/auth/drive",]
 
 
 def get_bigquery_client() -> Optional[bigquery.Client]:
     """
     Create and return a BigQuery client, or None if BigQuery is not configured.
+    Uses BigQuery-only scope to avoid Drive/Sheets permission errors.
     """
     if not settings.BIGQUERY_PROJECT_ID:
         return None
     if settings.BIGQUERY_CREDENTIALS_PATH:
-        client = bigquery.Client.from_service_account_json(
+        credentials = service_account.Credentials.from_service_account_file(
             settings.BIGQUERY_CREDENTIALS_PATH,
+            scopes=BIGQUERY_SCOPE,
+        )
+        client = bigquery.Client(
+            credentials=credentials,
             project=settings.BIGQUERY_PROJECT_ID,
             location=settings.BIGQUERY_LOCATION,
         )

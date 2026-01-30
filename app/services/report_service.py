@@ -12,8 +12,18 @@ from pathlib import Path
 from typing import Any, Optional
 import sys
 
+# BigQuery: feature list for individual complexity (Visualization, etc.)
+FEATURE_LIST_QUERY = (
+    "SELECT feature_area, feature, complexity, feasibility, description, recommended "
+    "FROM `tableau-to-looker-migration.C2L_Complexity_Rules.Feature_List_Looker_Perspective` "
+    "LIMIT 1000"
+)
+FEATURE_AREA_VISUALIZATION = "Visualization"
+
 from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.db.bigquery import get_bigquery_client
 from app.models.assessment import Assessment
 from app.models.object import ExtractedObject, ObjectRelationship
 
@@ -155,6 +165,58 @@ def build_containment_tree(
 class ReportService:
     def __init__(self, db: Session):
         self.db = db
+        # Cached feature list from BigQuery (loaded once, reused for individual complexity)
+        self._feature_list_cache: Optional[list[dict[str, Any]]] = None
+
+    def _run_bigquery_query(self, query: str) -> list[dict[str, Any]]:
+        """
+        Run a BigQuery query and return rows as list of dicts.
+        Returns [] if BigQuery is not configured or query fails.
+        """
+        client = get_bigquery_client()
+        if not client:
+            return []
+        try:
+            job = client.query(query)
+            rows = job.result()
+            return [dict(row) for row in rows]
+        except Exception:
+            return []
+
+    def _get_feature_list(self) -> list[dict[str, Any]]:
+        """
+        Load feature list from BigQuery once and cache on this instance.
+        Reused for individual complexity (e.g. Visualization breakdown).
+        """
+        if self._feature_list_cache is None:
+            self._feature_list_cache = self._run_bigquery_query(FEATURE_LIST_QUERY)
+        return self._feature_list_cache
+
+    def _get_visualization_complexity_lookup(self) -> dict[str, dict[str, Any]]:
+        """
+        From cached feature list, filter feature_area == 'Visualization' and build
+        a lookup by normalized feature name -> {complexity, feasibility, description, recommended}.
+        Used to set per-visualization complexity in visualization_details breakdown.
+        """
+        rows = self._get_feature_list()
+        lookup: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            area = (r.get("feature_area") or "").strip()
+            if area != FEATURE_AREA_VISUALIZATION:
+                continue
+            feature = (r.get("feature") or "").strip()
+            if not feature:
+                continue
+            key = feature.lower()
+            # Keep first occurrence if duplicates (e.g. same feature name)
+            if key not in lookup:
+                lookup[key] = {
+                    "complexity": r.get("complexity"),
+                    "feasibility": r.get("feasibility"),
+                    "description": r.get("description"),
+                    "recommended": r.get("recommended"),
+                }
+        return lookup
 
     def get_containment_tree(self, assessment: Assessment) -> ContainmentTree:
         """
@@ -266,23 +328,43 @@ class ReportService:
                     report_roots.add(("file", obj.file_id))
             viz_to_count_and_containers[viz_type] = (count, dash_roots, report_roots)
         total = sum(t[0] for t in viz_to_count_and_containers.values())
-        breakdown = [
-            {
+        viz_complexity_lookup = self._get_visualization_complexity_lookup()
+        breakdown = []
+        for viz, (count, dash_roots, report_roots) in sorted(
+            viz_to_count_and_containers.items(), key=lambda x: -x[1][0]
+        ):
+            key = (viz or "").strip().lower()
+            info = viz_complexity_lookup.get(key) or {}
+            complexity = (info.get("complexity") if info else None) or "Unknown"
+            breakdown.append({
                 "visualization": viz,
                 "count": count,
                 "complexity": complexity,
+                "feasibility": info.get("feasibility"),
+                "description": info.get("description"),
+                "recommended": info.get("recommended"),
                 "dashboards_containing_count": len(dash_roots),
                 "reports_containing_count": len(report_roots),
-            }
-            for viz, (count, dash_roots, report_roots) in sorted(
-                viz_to_count_and_containers.items(), key=lambda x: -x[1][0]
-            )
-        ]
-
+            })
+        # Aggregate counts by complexity (low, medium, high, critical)
+        stats: dict[str, int] = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+        for item in breakdown:
+            c = (item.get("complexity") or "").strip().lower()
+            cnt = item.get("count") or 0
+            if c == "low":
+                stats["low"] += cnt
+            elif c == "medium":
+                stats["medium"] += cnt
+            elif c == "high":
+                stats["high"] += cnt
+            elif c == "critical":
+                stats["critical"] += cnt
+        overall_complexity = None
 
         return {
             "total_visualization": total,
-            'overall_complexity': overall_complexity,
+            "overall_complexity": overall_complexity,
+            "stats": stats,
             "breakdown": breakdown,
         }
 
@@ -331,6 +413,7 @@ class ReportService:
             if ot == "dashboard":
                 dashboard_to_ids[oid].add(oid)
 
+        viz_complexity_lookup = self._get_visualization_complexity_lookup()
         dashboards_list: list[dict[str, Any]] = []
         for dash_id, member_ids in dashboard_to_ids.items():
             dash_obj = id_to_obj.get(dash_id)
@@ -343,6 +426,17 @@ class ReportService:
                 ot = _normalize_object_type(obj.object_type)
                 if self._is_visualization_object(obj):
                     counts["visualizations"] += 1
+                    key = (self._get_visualization_type_for_object(obj) or "").strip().lower()
+                    info = viz_complexity_lookup.get(key) or {}
+                    c = ((info.get("complexity") or "") or "").strip().lower()
+                    if c == "low":
+                        counts["visualizations_low"] += 1
+                    elif c == "medium":
+                        counts["visualizations_medium"] += 1
+                    elif c == "high":
+                        counts["visualizations_high"] += 1
+                    elif c == "critical":
+                        counts["visualizations_critical"] += 1
                 elif ot == "tab":
                     counts["tabs"] += 1
                 elif ot == "measure":
@@ -357,10 +451,29 @@ class ReportService:
                     counts["packages"] += 1
                 elif ot in ("data_source", "data_source_connection"):
                     counts["data_sources"] += 1
+            viz_by_complexity = {
+                "low": counts["visualizations_low"],
+                "medium": counts["visualizations_medium"],
+                "high": counts["visualizations_high"],
+                "critical": counts["visualizations_critical"],
+            }
+            # Dashboard complexity = worst level present (critical > high > medium > low)
+            if viz_by_complexity["critical"] > 0:
+                dashboard_complexity = "Critical"
+            elif viz_by_complexity["high"] > 0:
+                dashboard_complexity = "High"
+            elif viz_by_complexity["medium"] > 0:
+                dashboard_complexity = "Medium"
+            elif viz_by_complexity["low"] > 0:
+                dashboard_complexity = "Low"
+            else:
+                dashboard_complexity = "Unknown"  # no viz or all unknown
             dashboards_list.append({
                 "dashboard_id": str(dash_id),
                 "dashboard_name": name,
+                "complexity": dashboard_complexity,
                 "total_visualizations": counts["visualizations"],
+                "visualizations_by_complexity": viz_by_complexity,
                 "total_tabs": counts["tabs"],
                 "total_measures": counts["measures"],
                 "total_dimensions": counts["dimensions"],
@@ -370,8 +483,21 @@ class ReportService:
                 "total_data_sources": counts["data_sources"],
             })
         total_dashboards = len(dashboard_to_ids)
+        # Stats: count of dashboards by derived complexity (Low, Medium, High, Critical)
+        dashboard_stats: dict[str, int] = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+        for d in dashboards_list:
+            c = (d.get("complexity") or "").strip().lower()
+            if c == "low":
+                dashboard_stats["low"] += 1
+            elif c == "medium":
+                dashboard_stats["medium"] += 1
+            elif c == "high":
+                dashboard_stats["high"] += 1
+            elif c == "critical":
+                dashboard_stats["critical"] += 1
         return {
             "total_dashboards": total_dashboards,
+            "stats": dashboard_stats,
             "dashboards": dashboards_list,
         }
     
@@ -484,6 +610,7 @@ class ReportService:
                 ot = _normalize_object_type(obj.object_type)
                 add_external_by_type(report_id, oid, ot)
 
+        viz_complexity_lookup = self._get_visualization_complexity_lookup()
         reports_list: list[dict[str, Any]] = []
         for report_id, member_ids in report_to_ids.items():
             report_obj = id_to_obj.get(report_id)
@@ -497,6 +624,17 @@ class ReportService:
                 ot = _normalize_object_type(obj.object_type)
                 if self._is_visualization_object(obj):
                     counts["visualizations"] += 1
+                    key = (self._get_visualization_type_for_object(obj) or "").strip().lower()
+                    info = viz_complexity_lookup.get(key) or {}
+                    c = ((info.get("complexity") or "") or "").strip().lower()
+                    if c == "low":
+                        counts["visualizations_low"] += 1
+                    elif c == "medium":
+                        counts["visualizations_medium"] += 1
+                    elif c == "high":
+                        counts["visualizations_high"] += 1
+                    elif c == "critical":
+                        counts["visualizations_critical"] += 1
                 elif ot == "page":
                     counts["pages"] += 1
                 elif ot == "filter":
@@ -524,11 +662,30 @@ class ReportService:
                 if mobj and isinstance(mobj.properties, dict):
                     counts["tables"] += int(mobj.properties.get("table_count") or 0)
                     counts["columns"] += int(mobj.properties.get("column_count") or 0)
+            viz_by_complexity = {
+                "low": counts["visualizations_low"],
+                "medium": counts["visualizations_medium"],
+                "high": counts["visualizations_high"],
+                "critical": counts["visualizations_critical"],
+            }
+            # Report complexity = worst level present (critical > high > medium > low)
+            if viz_by_complexity["critical"] > 0:
+                report_complexity = "Critical"
+            elif viz_by_complexity["high"] > 0:
+                report_complexity = "High"
+            elif viz_by_complexity["medium"] > 0:
+                report_complexity = "Medium"
+            elif viz_by_complexity["low"] > 0:
+                report_complexity = "Low"
+            else:
+                report_complexity = "Unknown"
             reports_list.append({
                 "report_id": str(report_id),
                 "report_name": name,
                 "report_type": report_type,
+                "complexity": report_complexity,
                 "total_visualizations": counts["visualizations"],
+                "visualizations_by_complexity": viz_by_complexity,
                 "total_pages": counts["pages"],
                 "total_data_modules": len(report_to_data_modules.get(report_id, set())),
                 "total_packages": len(report_to_packages.get(report_id, set())),
@@ -544,8 +701,21 @@ class ReportService:
                 "total_dimensions": counts["dimensions"],
             })
         total_reports = len(report_to_ids)
+        # Stats: count of reports by derived complexity (Low, Medium, High, Critical)
+        report_stats: dict[str, int] = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+        for r in reports_list:
+            c = (r.get("complexity") or "").strip().lower()
+            if c == "low":
+                report_stats["low"] += 1
+            elif c == "medium":
+                report_stats["medium"] += 1
+            elif c == "high":
+                report_stats["high"] += 1
+            elif c == "critical":
+                report_stats["critical"] += 1
         return {
             "total_reports": total_reports,
+            "stats": report_stats,
             "reports": reports_list,
         }
 
@@ -649,9 +819,11 @@ class ReportService:
                     counts["tables"] += 1
                 elif ot == "column":
                     counts["columns"] += 1
+            complexity = "Medium" if counts["data_modules"] > 2 else "Low"
             packages_list.append({
                 "package_id": str(pkg_id),
                 "package_name": name,
+                "complexity": complexity,
                 "total_data_modules": counts["data_modules"],
                 "main_data_modules": counts["main_data_modules"],
                 "data_modules_by_type": dict(data_module_types),
@@ -659,8 +831,16 @@ class ReportService:
                 "total_columns": counts["columns"],
             })
         total_packages = len(packages_list)
+        _stats = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+        for p in packages_list:
+            c = (p.get("complexity") or "").strip().lower()
+            if c == "low": _stats["low"] += 1
+            elif c == "medium": _stats["medium"] += 1
+            elif c == "high": _stats["high"] += 1
+            elif c == "critical": _stats["critical"] += 1
         return {
             "total_packages": total_packages,
+            "stats": _stats,
             "packages": packages_list,
         }
 
@@ -814,18 +994,21 @@ class ReportService:
                 "connection_id": str(conn_id),
                 "connection_name": name,
                 "object_type": _normalize_object_type(obj.object_type),
+                "complexity": "Medium",
                 "dashboards_using_count": dash_count,
                 "reports_using_count": report_count,
                 **extra,
             }
             connections_list.append(item)
 
+        _stats = {"low": 0, "medium": len(connections_list), "high": 0, "critical": 0}
         return {
             "total_data_sources": total_data_sources,
             "total_data_source_connections": total_data_source_connections,
             "total_unique_connections": total_unique_connections,
             "total_data_modules": total_data_modules,
             "total_packages": total_packages,
+            "stats": _stats,
             "connections": connections_list,
         }
 
@@ -846,6 +1029,66 @@ class ReportService:
                 out[k] = v
         return out
 
+    def _get_prop_any_case(self, props: Any, *key_candidates: str) -> Any:
+        """
+        Get first non-None value from props for any of the keys, trying exact match
+        then case-insensitive match (DB/JSON may store keys with different casing).
+        """
+        if not props or not isinstance(props, dict):
+            return None
+        for key in key_candidates:
+            v = props.get(key)
+            if v is not None:
+                return v
+        key_lower = {k.lower(): k for k in key_candidates}
+        for pk, pv in props.items():
+            if isinstance(pk, str) and pk.lower() in key_lower and pv is not None:
+                return pv
+        return None
+
+    def _calculated_field_complexity(self, calculation_type: str, expression: Any) -> str:
+        """
+        Derive complexity for a calculated field from calculation_type and expression (props).
+        - embeddedCalculation → Medium
+        - case_expression | if_expression | aggregate_function | function → Low
+        - expression: default Low; scan expression text:
+          - critical: prefilter, quartile, power, position_regex, substring_regex, period
+          - medium: cast, lookup, running-minimum, running-maximum, moving-total, moving-average, standard-deviation
+          - else (arithmetic / default) → Low
+        """
+        ct = (calculation_type or "").strip().lower()
+        if ct == "embeddedCalculation":
+            return "Medium"
+        if ct in ("case_expression", "if_expression", "aggregate_function", "function"):
+            return "Low"
+        # type "expression" or unknown: check expression content
+        expr_str = (expression if isinstance(expression, str) else str(expression or "")).lower()
+        # Critical first
+        critical_terms = (
+            "prefilter", "quartile", "quantile", "power", 
+            "position_regex", "substring_regex", "period",
+            "lookup", "running-maximum", "running-minimum",
+            "moving-average", "standard-deviation",
+            "regression-average", "tanhyp", "variance",
+            "_ymdint_between", "_ymdint_to_date", "_ymdint_to_time",
+        )
+        for term in critical_terms:
+            if term in expr_str:
+                return "Critical"
+        # Medium
+        medium_terms = (
+            "cast", "moving-total", 
+            "_add_months", "_add_years", "_add_days", "_add_weeks", 
+            "_add_months", "_add_years", "_add_days", "_add_weeks",
+            "_first_of_month", "_days_between", "_first_of_year",
+            "_months_between", "_years_between",
+        )
+        for term in medium_terms:
+            if term in expr_str:
+                return "Medium"
+        # Default (arithmetic or plain expression) → Low
+        return "Low"
+
     def _get_calculated_fields_breakdown(self, objects: list[ExtractedObject]) -> dict[str, Any]:
         """Total calculated fields and per-field details (expression, type, etc.)."""
         items: list[dict[str, Any]] = []
@@ -854,10 +1097,14 @@ class ReportService:
                 continue
             props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
             extra = self._safe_props(props, ["expression", "calculation_type", "cognosClass"], preview_len=500)
+            calculation_type = (self._get_prop_any_case(props, "calculation_type") or "").strip() or "expression"
+            expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
+            complexity = self._calculated_field_complexity(calculation_type, expression_raw)
             items.append({
                 "calculated_field_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed>",
                 **extra,
+                "complexity": complexity,
             })
         return {"total_calculated_fields": len(items), "calculated_fields": items}
 
@@ -888,8 +1135,11 @@ class ReportService:
                 ],
                 preview_len=500,
             )
+            is_complex = props.get("is_complex") is True
+            complexity = "Medium" if is_complex else "Low"
             item: dict[str, Any] = {
                 "filter_id": str(obj.id),
+                "complexity": complexity,
                 "name": (obj.name or "").strip() or "<unnamed>",
                 **extra,
             }
@@ -904,7 +1154,14 @@ class ReportService:
                         item["associated_container_type"] = ot  # report, query, data_module, etc.
                         break
             items.append(item)
-        return {"total_filters": len(items), "filters": items}
+        _stats = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+        for it in items:
+            c = (it.get("complexity") or "").strip().lower()
+            if c == "low": _stats["low"] += 1
+            elif c == "medium": _stats["medium"] += 1
+            elif c == "high": _stats["high"] += 1
+            elif c == "critical": _stats["critical"] += 1
+        return {"total_filters": len(items), "stats": _stats, "filters": items}
 
     def _get_parameters_breakdown(self, objects: list[ExtractedObject]) -> dict[str, Any]:
         """Total parameters and per-parameter details (type, etc.)."""
@@ -918,8 +1175,10 @@ class ReportService:
                 "parameter_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed>",
                 **extra,
+                "complexity": "Medium",
             })
-        return {"total_parameters": len(items), "parameters": items}
+        _stats = {"low": 0, "medium": len(items), "high": 0, "critical": 0}
+        return {"total_parameters": len(items), "stats": _stats, "parameters": items}
 
     def _get_sorts_breakdown(self, objects: list[ExtractedObject]) -> dict[str, Any]:
         """Total sorts and per-sort details (direction, sorted column, etc.)."""
@@ -933,8 +1192,10 @@ class ReportService:
                 "sort_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed>",
                 **extra,
+                "complexity": "Low",
             })
-        return {"total_sorts": len(items), "sorts": items}
+        _stats = {"low": len(items), "medium": 0, "high": 0, "critical": 0}
+        return {"total_sorts": len(items), "stats": _stats, "sorts": items}
 
     def _get_prompts_breakdown(self, objects: list[ExtractedObject]) -> dict[str, Any]:
         """Total prompts and per-prompt details (type, value, etc.)."""
@@ -948,8 +1209,10 @@ class ReportService:
                 "prompt_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed>",
                 **extra,
+                "complexity": "Medium",
             })
-        return {"total_prompts": len(items), "prompts": items}
+        _stats = {"low": 0, "medium": len(items), "high": 0, "critical": 0}
+        return {"total_prompts": len(items), "stats": _stats, "prompts": items}
 
     def _get_data_module_properties(self, obj: ExtractedObject) -> dict[str, Any]:
         """Extract display-safe properties for a data module (from parser: storeID, cognosClass, is_main_module, etc.)."""
@@ -1090,6 +1353,7 @@ class ReportService:
             item: dict[str, Any] = {
                 "data_module_id": str(module_id),
                 "name": name,
+                "complexity": "Medium",
                 "dashboards_using_count": dash_count,
                 "reports_using_count": report_count,
                 **extra,
@@ -1098,10 +1362,12 @@ class ReportService:
             if self._is_main_data_module(obj):
                 main_modules_list.append(item)
 
+        _stats = {"low": 0, "medium": len(modules_list), "high": 0, "critical": 0}
         return {
             "total_data_modules": total_data_modules,
             "total_main_data_modules": total_main_data_modules,
             "total_unique_modules": total_unique_modules,
+            "stats": _stats,
             "data_modules": modules_list,
             "main_data_modules": main_modules_list,
         }
@@ -1133,6 +1399,7 @@ class ReportService:
                     report_name = (report_obj.name or "").strip() or None
             is_simple = source_type in ("model", "sql")
             is_complex = source_type == "query_ref"
+            complexity = "Medium" if is_complex else "Low"
             extra = self._safe_props(props, ["cognosClass", "source_type", "sql_content"], preview_len=500)
             items.append({
                 "query_id": str(obj.id),
@@ -1143,8 +1410,16 @@ class ReportService:
                 "report_id": report_id,
                 "report_name": report_name,
                 **extra,
+                "complexity": complexity,
             })
-        return {"total_queries": len(items), "queries": items}
+        _stats = {"low": 0, "medium": 0, "high": 0, "critical": 0}
+        for it in items:
+            c = (it.get("complexity") or "").strip().lower()
+            if c == "low": _stats["low"] += 1
+            elif c == "medium": _stats["medium"] += 1
+            elif c == "high": _stats["high"] += 1
+            elif c == "critical": _stats["critical"] += 1
+        return {"total_queries": len(items), "stats": _stats, "queries": items}
 
     def _get_measures_breakdown(
         self,
@@ -1156,6 +1431,8 @@ class ReportService:
         Per-measure breakdown: name, aggregation type, parent data module (walk parent_id/HAS_COLUMN
         and CONTAINS up to data_module), and other properties. Simple measure = no or trivial
         aggregation; complex = non-trivial aggregation or expression.
+        Complexity is derived from the expression property only (measures have no calculation_type);
+        same expression-based rules as calculated fields (critical/medium/low terms).
         """
         id_to_obj = tree.id_to_obj
         parent_map: dict[Any, Any] = {}
@@ -1193,6 +1470,9 @@ class ReportService:
             is_complex = not is_simple
             module_id, module_name = get_parent_module_id(obj.id)
             extra = self._safe_props(props, ["cognosClass", "regularAggregate", "datatype", "usage", "expression"], preview_len=300)
+            # Measures have only "expression" (no calculation_type); same expression-based complexity rules as calculated fields
+            expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
+            complexity = self._calculated_field_complexity("expression", expression_raw)
             items.append({
                 "measure_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed measure>",
@@ -1202,6 +1482,7 @@ class ReportService:
                 "parent_module_id": str(module_id) if module_id is not None else None,
                 "parent_module_name": module_name,
                 **extra,
+                "complexity": complexity,
             })
         return {"total_measures": len(items), "measures": items}
 
@@ -1252,6 +1533,9 @@ class ReportService:
             is_complex = not is_simple
             module_id, module_name = get_parent_module_id(obj.id)
             extra = self._safe_props(props, ["cognosClass", "usage", "datatype", "expression"], preview_len=300)
+            # Dimensions have only "expression" (no calculation_type); same expression-based complexity as measures
+            expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
+            complexity = self._calculated_field_complexity("expression", expression_raw)
             items.append({
                 "dimension_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed dimension>",
@@ -1261,6 +1545,7 @@ class ReportService:
                 "parent_module_id": str(module_id) if module_id is not None else None,
                 "parent_module_name": module_name,
                 **extra,
+                "complexity": complexity,
             })
         return {"total_dimensions": len(items), "dimensions": items}
 

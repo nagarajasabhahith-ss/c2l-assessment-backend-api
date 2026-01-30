@@ -6,19 +6,34 @@ from pydantic import BaseModel, Field
 class VisualizationBreakdownItem(BaseModel):
     visualization: str
     count: int
+    complexity: str = "Unknown"
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
 
 
+class VisualizationComplexityStats(BaseModel):
+    """Counts of visualizations by complexity (low, medium, high, critical)."""
+    low: int = 0
+    medium: int = 0
+    high: int = 0
+    critical: int = 0
+
+
 class VisualizationDetails(BaseModel):
     total_visualization: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     breakdown: list[VisualizationBreakdownItem]
 
 
 class DashboardBreakdownItem(BaseModel):
     dashboard_id: str
     dashboard_name: str
+    """Derived from visualizations_by_complexity: worst level present (Critical > High > Medium > Low)."""
+    complexity: str = "Unknown"
     total_visualizations: int = 0
+    visualizations_by_complexity: VisualizationComplexityStats = Field(
+        default_factory=lambda: VisualizationComplexityStats()
+    )
     total_tabs: int = 0
     total_measures: int = 0
     total_dimensions: int = 0
@@ -30,6 +45,8 @@ class DashboardBreakdownItem(BaseModel):
 
 class DashboardsBreakdown(BaseModel):
     total_dashboards: int
+    """Count of dashboards by derived complexity (low, medium, high, critical)."""
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     dashboards: list[DashboardBreakdownItem]
 
 
@@ -37,7 +54,12 @@ class ReportBreakdownItem(BaseModel):
     report_id: str
     report_name: str
     report_type: str = "report"  # report, interactiveReport, reportView, dataSet2, reportVersion
+    """Derived from visualizations_by_complexity: worst level present (Critical > High > Medium > Low)."""
+    complexity: str = "Unknown"
     total_visualizations: int = 0
+    visualizations_by_complexity: VisualizationComplexityStats = Field(
+        default_factory=lambda: VisualizationComplexityStats()
+    )
     total_pages: int = 0
     total_data_modules: int = 0
     total_packages: int = 0
@@ -55,12 +77,16 @@ class ReportBreakdownItem(BaseModel):
 
 class ReportsBreakdown(BaseModel):
     total_reports: int
+    """Count of reports by derived complexity (low, medium, high, critical)."""
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     reports: list[ReportBreakdownItem]
 
 
 class PackageBreakdownItem(BaseModel):
     package_id: str
     package_name: str
+    """Derived from data_modules count: > 2 → Medium, else Low."""
+    complexity: str = "Low"
     total_data_modules: int = 0
     main_data_modules: int = 0  # module, dataModule, model only (excludes smartsModule, modelView, dataSet2)
     data_modules_by_type: Dict[str, int] = Field(default_factory=dict)  # smartsModule, dataModule, module, etc.
@@ -70,6 +96,7 @@ class PackageBreakdownItem(BaseModel):
 
 class PackagesBreakdown(BaseModel):
     total_packages: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     packages: list[PackageBreakdownItem]
 
 
@@ -77,6 +104,8 @@ class DataSourceConnectionBreakdownItem(BaseModel):
     connection_id: str
     connection_name: str
     object_type: str  # data_source | data_source_connection
+    """All data source connections: Medium."""
+    complexity: str = "Medium"
     dashboards_using_count: int = 0
     reports_using_count: int = 0
     identifier: Optional[str] = None
@@ -94,12 +123,15 @@ class DataSourceConnectionsBreakdown(BaseModel):
     total_unique_connections: int
     total_data_modules: int
     total_packages: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     connections: list[DataSourceConnectionBreakdownItem]
 
 
 class CalculatedFieldBreakdownItem(BaseModel):
     calculated_field_id: str
     name: str
+    """Derived from calculation_type and expression (embeddedCalculation→Medium; expression scanned for critical/medium terms)."""
+    complexity: str = "Low"
     expression: Optional[str] = None
     calculation_type: Optional[str] = None
     cognos_class: Optional[str] = None
@@ -115,6 +147,8 @@ class CalculatedFieldsBreakdown(BaseModel):
 class FilterBreakdownItem(BaseModel):
     filter_id: str
     name: str
+    """Derived from is_complex: True → Medium, else Low."""
+    complexity: str = "Low"
     expression: Optional[str] = None
     filter_type: Optional[str] = None  # detail, summary
     filter_scope: Optional[str] = None  # query_level, report_level, data_module, data_set
@@ -136,12 +170,15 @@ class FilterBreakdownItem(BaseModel):
 
 class FiltersBreakdown(BaseModel):
     total_filters: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     filters: list[FilterBreakdownItem]
 
 
 class ParameterBreakdownItem(BaseModel):
     parameter_id: str
     name: str
+    """All parameters: Medium."""
+    complexity: str = "Medium"
     parameter_type: Optional[str] = None
     variable_type: Optional[str] = None
     cognos_class: Optional[str] = None
@@ -151,12 +188,15 @@ class ParameterBreakdownItem(BaseModel):
 
 class ParametersBreakdown(BaseModel):
     total_parameters: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     parameters: list[ParameterBreakdownItem]
 
 
 class SortBreakdownItem(BaseModel):
     sort_id: str
     name: str
+    """All sorts: Low."""
+    complexity: str = "Low"
     direction: Optional[str] = None
     sorted_column: Optional[str] = None
     sort_items: Optional[List[Any]] = None
@@ -167,12 +207,15 @@ class SortBreakdownItem(BaseModel):
 
 class SortsBreakdown(BaseModel):
     total_sorts: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     sorts: list[SortBreakdownItem]
 
 
 class PromptBreakdownItem(BaseModel):
     prompt_id: str
     name: str
+    """All prompts: Medium."""
+    complexity: str = "Medium"
     prompt_type: Optional[str] = None
     value: Optional[str] = None
     cognos_class: Optional[str] = None
@@ -182,12 +225,15 @@ class PromptBreakdownItem(BaseModel):
 
 class PromptsBreakdown(BaseModel):
     total_prompts: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     prompts: list[PromptBreakdownItem]
 
 
 class QueryBreakdownItem(BaseModel):
     query_id: str
     name: str
+    """Derived from is_complex: true → Medium, else Low."""
+    complexity: str = "Low"
     source_type: Optional[str] = None  # model, query_ref, sql
     is_simple: bool = False
     is_complex: bool = False
@@ -201,12 +247,15 @@ class QueryBreakdownItem(BaseModel):
 
 class QueriesBreakdown(BaseModel):
     total_queries: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     queries: list[QueryBreakdownItem]
 
 
 class MeasureBreakdownItem(BaseModel):
     measure_id: str
     name: str
+    """Derived from expression (same rules as calculated fields: critical/medium/low terms)."""
+    complexity: str = "Low"
     aggregation: Optional[str] = None
     is_simple: bool = False
     is_complex: bool = False
@@ -228,6 +277,8 @@ class MeasuresBreakdown(BaseModel):
 class DimensionBreakdownItem(BaseModel):
     dimension_id: str
     name: str
+    """Derived from expression (same rules as calculated fields/measures: critical/medium/low terms)."""
+    complexity: str = "Low"
     usage: Optional[str] = None
     is_simple: bool = False
     is_complex: bool = False
@@ -248,6 +299,8 @@ class DimensionsBreakdown(BaseModel):
 class DataModuleBreakdownItem(BaseModel):
     data_module_id: str
     name: str
+    """All data modules: Medium."""
+    complexity: str = "Medium"
     dashboards_using_count: int = 0
     reports_using_count: int = 0
     is_main_module: Optional[bool] = None  # True for module/dataModule/model; False for smartsModule/modelView/dataSet2
@@ -271,6 +324,7 @@ class DataModulesBreakdown(BaseModel):
     total_data_modules: int
     total_main_data_modules: int = 0  # module, dataModule, model only (excludes smartsModule, modelView, dataSet2)
     total_unique_modules: int
+    stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     data_modules: list[DataModuleBreakdownItem]
     main_data_modules: list[DataModuleBreakdownItem] = Field(default_factory=list)  # main-only list (module, dataModule, model)
 

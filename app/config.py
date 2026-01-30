@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     BIGQUERY_PROJECT_ID: str = ""
     BIGQUERY_CREDENTIALS_PATH: str = ""  # Path to service account JSON; or set GOOGLE_APPLICATION_CREDENTIALS
     BIGQUERY_LOCATION: str = "US"  # Default location for jobs (e.g. US, EU)
+    # Optional: fully qualified table for complexity/feature lookup used by report service (dataset.table or project.dataset.table)
+    BIGQUERY_FEATURE_TABLE: str = ""
 
     # Google Cloud Storage (optional – uploads go to GCS when set)
     GCS_BUCKET: str = ""

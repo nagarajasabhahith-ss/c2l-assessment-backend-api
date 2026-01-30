@@ -52,5 +52,13 @@ def bigquery_connect(client=Depends(get_bigquery_client)):
 
 @router.get("/example")
 def example(client = Depends(require_bigquery)):
-    job = client.query("SELECT * FROM `tableau-to-looker-migration.C2L_Complexity_Rules.Feature_List_Looker_Perspective` LIMIT 1000")
+    
+    # Visualization_Type: feature list for Visualization feature_area
+    job = client.query(
+        "SELECT * FROM `tableau-to-looker-migration.C2L_Complexity_Rules.Feature_List_Looker_Perspective` "
+        "LIMIT 1000"
+    )
+    # job = client.query("SELECT * FROM `tableau-to-looker-migration.C2L_Complexity_analysis.Complexity_Analysis_List` LIMIT 1000")
+
+
     return list(job.result())
