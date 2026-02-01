@@ -57,6 +57,22 @@ class FilterByComplexityItem(BaseModel):
     reports_containing_count: int = 0
 
 
+class MeasureByComplexityItem(BaseModel):
+    """Per-complexity: measure count and dashboards/reports containing."""
+    complexity: str = "low"  # low | medium | high | critical
+    measure_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
+
+
+class DimensionByComplexityItem(BaseModel):
+    """Per-complexity: dimension count and dashboards/reports containing."""
+    complexity: str = "low"  # low | medium | high | critical
+    dimension_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
+
+
 class VisualizationDetails(BaseModel):
     total_visualization: int
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
@@ -135,6 +151,10 @@ class PackageBreakdownItem(BaseModel):
     data_modules_by_type: Dict[str, int] = Field(default_factory=dict)  # smartsModule, dataModule, module, etc.
     total_tables: int = 0
     total_columns: int = 0
+    """Distinct dashboards that use this package (BFS from roots via containment, usage, has_column reverse)."""
+    dashboards_using_count: int = 0
+    """Distinct reports that use this package."""
+    reports_using_count: int = 0
 
 
 class PackagesBreakdown(BaseModel):
@@ -237,14 +257,25 @@ class ParameterBreakdownItem(BaseModel):
     parameter_type: Optional[str] = None
     variable_type: Optional[str] = None
     cognos_class: Optional[str] = None
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
     class Config:
         extra = "allow"
+
+
+class ParameterByComplexityItem(BaseModel):
+    """Per-complexity: parameter count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"
+    parameter_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
 
 
 class ParametersBreakdown(BaseModel):
     total_parameters: int
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     parameters: list[ParameterBreakdownItem]
+    by_complexity: Dict[str, ParameterByComplexityItem] = Field(default_factory=dict)
 
 
 class SortBreakdownItem(BaseModel):
@@ -256,14 +287,25 @@ class SortBreakdownItem(BaseModel):
     sorted_column: Optional[str] = None
     sort_items: Optional[List[Any]] = None
     cognos_class: Optional[str] = None
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
     class Config:
         extra = "allow"
+
+
+class SortByComplexityItem(BaseModel):
+    """Per-complexity: sort count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"
+    sort_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
 
 
 class SortsBreakdown(BaseModel):
     total_sorts: int
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     sorts: list[SortBreakdownItem]
+    by_complexity: Dict[str, SortByComplexityItem] = Field(default_factory=dict)
 
 
 class PromptBreakdownItem(BaseModel):
@@ -274,14 +316,25 @@ class PromptBreakdownItem(BaseModel):
     prompt_type: Optional[str] = None
     value: Optional[str] = None
     cognos_class: Optional[str] = None
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
     class Config:
         extra = "allow"
+
+
+class PromptByComplexityItem(BaseModel):
+    """Per-complexity: prompt count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"
+    prompt_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
 
 
 class PromptsBreakdown(BaseModel):
     total_prompts: int
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     prompts: list[PromptBreakdownItem]
+    by_complexity: Dict[str, PromptByComplexityItem] = Field(default_factory=dict)
 
 
 class QueryBreakdownItem(BaseModel):
@@ -296,14 +349,25 @@ class QueryBreakdownItem(BaseModel):
     report_name: Optional[str] = None
     cognos_class: Optional[str] = None
     sql_content: Optional[str] = None
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
     class Config:
         extra = "allow"
+
+
+class QueryByComplexityItem(BaseModel):
+    """Per-complexity: query count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"
+    query_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
 
 
 class QueriesBreakdown(BaseModel):
     total_queries: int
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     queries: list[QueryBreakdownItem]
+    by_complexity: Dict[str, QueryByComplexityItem] = Field(default_factory=dict)
 
 
 class MeasureBreakdownItem(BaseModel):
@@ -408,6 +472,12 @@ class ComplexAnalysis(BaseModel):
     report: List[ReportByComplexityItem] = Field(default_factory=list)
     calculated_field: List[CalculatedFieldByComplexityItem] = Field(default_factory=list)
     filter: List[FilterByComplexityItem] = Field(default_factory=list)
+    measure: List[MeasureByComplexityItem] = Field(default_factory=list)
+    dimension: List[DimensionByComplexityItem] = Field(default_factory=list)
+    parameter: List[ParameterByComplexityItem] = Field(default_factory=list)
+    sort: List[SortByComplexityItem] = Field(default_factory=list)
+    prompt: List[PromptByComplexityItem] = Field(default_factory=list)
+    query: List[QueryByComplexityItem] = Field(default_factory=list)
 
 
 class AssessmentReportResponse(BaseModel):
