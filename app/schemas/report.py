@@ -27,18 +27,24 @@ class VisualizationByComplexityItem(BaseModel):
     visualization_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class DashboardByComplexityItem(BaseModel):
     """Per-complexity: distinct dashboards containing that complexity."""
     complexity: str = "low"  # low | medium | high | critical
     dashboards_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class ReportByComplexityItem(BaseModel):
     """Per-complexity: distinct reports containing that complexity."""
     complexity: str = "low"  # low | medium | high | critical
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class CalculatedFieldByComplexityItem(BaseModel):
@@ -47,6 +53,8 @@ class CalculatedFieldByComplexityItem(BaseModel):
     calculated_field_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class FilterByComplexityItem(BaseModel):
@@ -55,6 +63,8 @@ class FilterByComplexityItem(BaseModel):
     filter_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class MeasureByComplexityItem(BaseModel):
@@ -63,6 +73,8 @@ class MeasureByComplexityItem(BaseModel):
     measure_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class DimensionByComplexityItem(BaseModel):
@@ -71,6 +83,8 @@ class DimensionByComplexityItem(BaseModel):
     dimension_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class VisualizationDetails(BaseModel):
@@ -269,6 +283,8 @@ class ParameterByComplexityItem(BaseModel):
     parameter_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class ParametersBreakdown(BaseModel):
@@ -299,6 +315,8 @@ class SortByComplexityItem(BaseModel):
     sort_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class SortsBreakdown(BaseModel):
@@ -328,6 +346,8 @@ class PromptByComplexityItem(BaseModel):
     prompt_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class PromptsBreakdown(BaseModel):
@@ -361,6 +381,8 @@ class QueryByComplexityItem(BaseModel):
     query_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
 
 
 class QueriesBreakdown(BaseModel):
@@ -480,7 +502,71 @@ class ComplexAnalysis(BaseModel):
     query: List[QueryByComplexityItem] = Field(default_factory=list)
 
 
+class KeyFinding(BaseModel):
+    """Key finding per feature area: representative complexity, count, and usage in dashboards/reports."""
+    feature_area: str
+    complexity: str
+    count: int
+    dashboards_summary: str
+    reports_summary: str
+    dashboards_percent: float = 0.0
+    reports_percent: float = 0.0
+
+
+class HighLevelComplexityOverviewItem(BaseModel):
+    """Per-complexity level: counts for Visualization, Dashboard, Report."""
+    complexity: str
+    visualization_count: int = 0
+    dashboard_count: int = 0
+    report_count: int = 0
+
+
+class InventoryItem(BaseModel):
+    """Total count for an asset type (Dashboard, Report, Visualization, etc.)."""
+    asset_type: str
+    count: int
+
+
+class Summary(BaseModel):
+    """Report summary with key findings, high-level complexity overview, and inventory."""
+    key_findings: List[KeyFinding] = Field(default_factory=list)
+    high_level_complexity_overview: List[HighLevelComplexityOverviewItem] = Field(default_factory=list)
+    inventory: List[InventoryItem] = Field(default_factory=list)
+
+
+class ChallengeItem(BaseModel):
+    """Per-visualization challenge: visualization name, type, complexity, description, recommended, and container name."""
+    visualization: str
+    visualization_type: str
+    complexity: str
+    description: Optional[str] = None
+    recommended: Optional[str] = None
+    dashboard_or_report_name: Optional[str] = None
+
+
+class ChallengesResponse(BaseModel):
+    """Challenges keyed by category; 'visualization' contains per-visualization challenge items."""
+    visualization: List[ChallengeItem] = Field(default_factory=list)
+
+
+class AppendixItem(BaseModel):
+    """Appendix row: name, package(s), data module(s), owner (for dashboard or report)."""
+    name: str
+    package: List[str] = Field(default_factory=list)
+    data_module: List[str] = Field(default_factory=list)
+    owner: str = ""
+
+
+class AppendixResponse(BaseModel):
+    """Appendix: dashboards and reports with name, package(s), data module(s), owner."""
+    dashboards: List[AppendixItem] = Field(default_factory=list)
+    reports: List[AppendixItem] = Field(default_factory=list)
+
+
 class AssessmentReportResponse(BaseModel):
     assessment_id: str
     sections: ReportSections
     complex_analysis: ComplexAnalysis = Field(default_factory=lambda: ComplexAnalysis())
+    summary: Optional[Summary] = None
+    challenges: Optional[ChallengesResponse] = None
+    appendix: Optional[AppendixResponse] = None
