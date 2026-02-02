@@ -441,6 +441,9 @@ class ReportService:
 
         report["appendix"] = self._get_appendix(objects, tree, relationships)
 
+        # Include optional usage_stats from assessment (from usage_stats.json upload)
+        report["usage_stats"] = getattr(assessment, "usage_stats", None)
+
         return report
 
     def _build_complex_analysis(self, sections: dict[str, Any]) -> dict[str, Any]:

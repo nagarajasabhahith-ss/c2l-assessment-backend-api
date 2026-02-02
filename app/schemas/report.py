@@ -570,3 +570,5 @@ class AssessmentReportResponse(BaseModel):
     summary: Optional[Summary] = None
     challenges: Optional[ChallengesResponse] = None
     appendix: Optional[AppendixResponse] = None
+    """Optional usage stats from usage_stats.json upload (usage_stats, content_creation, user_stats, performance, quick_wins, pilot_recommendations)."""
+    usage_stats: Optional[Dict[str, Any]] = None

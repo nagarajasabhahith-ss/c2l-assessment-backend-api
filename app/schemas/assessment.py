@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, ConfigDict
-from typing import Optional
+from typing import Optional, Any
 from datetime import datetime
 from uuid import UUID
 from app.models.assessment import AssessmentStatus
@@ -26,12 +26,14 @@ class AssessmentResponse(AssessmentBase):
     created_at: datetime
     updated_at: datetime
     completed_at: Optional[datetime] = None
-    
+    # Optional usage stats from usage_stats.json upload (usage_stats, content_creation, user_stats, performance, quick_wins, pilot_recommendations)
+    usage_stats: Optional[dict[str, Any]] = None
+
     # Counts (computed)
     files_count: int = 0
     objects_count: int = 0
     relationships_count: int = 0
-    
+
     model_config = ConfigDict(from_attributes=True)
 
 

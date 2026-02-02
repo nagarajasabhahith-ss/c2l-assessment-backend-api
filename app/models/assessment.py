@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime
-from sqlalchemy import Column, String, DateTime, Enum as SQLEnum, ForeignKey, Uuid
+from sqlalchemy import Column, String, DateTime, Enum as SQLEnum, ForeignKey, Uuid, JSON
 from sqlalchemy.orm import relationship
 from app.db.session import Base
 
@@ -25,6 +25,8 @@ class Assessment(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+    # Optional usage stats JSON (uploaded as usage_stats.json); structure: usage_stats, content_creation, user_stats, performance, quick_wins, pilot_recommendations
+    usage_stats = Column(JSON, nullable=True)
 
     # Relationships
     files = relationship("UploadedFile", back_populates="assessment", cascade="all, delete-orphan")

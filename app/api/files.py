@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Any
+import json
 import uuid
 import os
 from pathlib import Path
@@ -15,6 +16,13 @@ from app.api.auth import get_current_user
 from app.services.storage_service import upload_file as storage_upload, delete_file as storage_delete
 
 router = APIRouter()
+
+# Fixed filename for usage stats upload (with .json extension)
+USAGE_STATS_FILENAME = "usage_stats.json"
+# Expected top-level keys in usage_stats.json (at least one must be present)
+USAGE_STATS_KNOWN_KEYS = frozenset({
+    "usage_stats", "content_creation", "user_stats", "performance", "quick_wins", "pilot_recommendations",
+})
 
 
 def get_file_type(filename: str) -> FileType:
@@ -39,6 +47,25 @@ def validate_file(file: UploadFile) -> None:
             status_code=400,
             detail=f"File type not allowed. Supported: {', '.join(settings.ALLOWED_EXTENSIONS)}"
         )
+
+
+def parse_and_validate_usage_stats(content: bytes) -> dict[str, Any]:
+    """
+    Parse usage_stats.json content and validate structure.
+    Expects a JSON object with at least one known top-level key.
+    """
+    try:
+        data = json.loads(content.decode("utf-8"))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON in usage_stats file: {e}")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="usage_stats file must be a JSON object")
+    if not (USAGE_STATS_KNOWN_KEYS & set(data.keys())):
+        raise HTTPException(
+            status_code=400,
+            detail=f"usage_stats file must contain at least one of: {sorted(USAGE_STATS_KNOWN_KEYS)}",
+        )
+    return data
 
 
 @router.post("/assessments/{assessment_id}/files", response_model=FileUploadResponse)
@@ -111,6 +138,12 @@ async def upload_files(
             db.add(uploaded_file)
             db.commit()
             db.refresh(uploaded_file)
+
+            # If this is the fixed usage_stats.json, parse and store on assessment
+            if Path(file.filename).name.lower() == USAGE_STATS_FILENAME.lower() and file_type == FileType.JSON:
+                usage_data = parse_and_validate_usage_stats(content)
+                assessment.usage_stats = usage_data
+                db.commit()
             
             uploaded.append(UploadedFileResponse.from_orm(uploaded_file))
             
@@ -179,12 +212,16 @@ async def delete_file(
     
     if not assessment:
         raise HTTPException(status_code=404, detail="File not found")
-    
+
+    # Clear usage_stats on assessment if this file is the fixed usage_stats.json
+    if Path(uploaded_file.filename).name.lower() == USAGE_STATS_FILENAME.lower():
+        assessment.usage_stats = None
+
     # Delete physical file (local or GCS)
     storage_delete(uploaded_file.file_path)
-    
+
     # Delete database record (cascade will handle related data)
     db.delete(uploaded_file)
     db.commit()
-    
+
     return None
