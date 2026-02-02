@@ -34,13 +34,21 @@ async def startup_event():
     logger.info(f"Starting {settings.APP_NAME} v{settings.VERSION}")
     logger.info(f"Environment: {settings.ENVIRONMENT}")
     
-    # Create DB tables
+    # Create DB tables (non-blocking: app starts even if DB is unreachable)
+    from sqlalchemy.exc import OperationalError
     from app.db.session import engine, Base
-    import app.models # noqa: F401 - Import models to register them
-    
+    import app.models  # noqa: F401 - Import models to register them
+
     logger.info("Creating database tables...")
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created.")
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Database tables created.")
+    except OperationalError as e:
+        logger.warning(
+            "Database unreachable at startup (tables not created). "
+            "Check DATABASE_URL and, on Cloud Run, ensure --add-cloudsql-instances is set. Error: %s",
+            e,
+        )
 
 
 @app.on_event("shutdown")

@@ -3,12 +3,13 @@ Service for conducting parsing operations on assessment files.
 Supports local paths and gs:// (GCS) paths via temporary download.
 """
 from pathlib import Path
+from datetime import datetime
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
 from typing import List
 
 from app.models.assessment import Assessment, AssessmentStatus
-from app.models.file import UploadedFile
+from app.models.file import UploadedFile, ParseStatus
 from app.services.storage_service import get_local_path
 from app.models.object import ExtractedObject, ObjectRelationship
 from app.db.session import get_db
@@ -65,6 +66,9 @@ class ParserService:
             total_objects = 0
             
             for file in assessment.files:
+                file.parse_status = ParseStatus.PARSING
+                self.db.commit()
+
                 # Resolve path: local file or download from GCS to temp
                 try:
                     with get_local_path(file.file_path) as local_path:
@@ -75,12 +79,15 @@ class ParserService:
                             result = parser.parse(local_path)
                             self._persist_results(result, assessment.id, file.id)
                             total_objects += len(result.objects)
+                            file.parse_status = ParseStatus.COMPLETED
+                            file.parsed_at = datetime.utcnow()
                         except Exception as e:
                             print(f"Error parsing file {file.file_path}: {e}")
-                            continue
+                            file.parse_status = ParseStatus.FAILED
                 except Exception as e:
                     print(f"Error resolving/reading file {file.file_path}: {e}")
-                    continue
+                    file.parse_status = ParseStatus.FAILED
+                self.db.commit()
             
             assessment.status = AssessmentStatus.COMPLETED
             self.db.commit()
