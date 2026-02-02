@@ -60,8 +60,8 @@ async def list_assessments(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List all assessments for current user"""
-    query = db.query(Assessment).filter(Assessment.user_id == current_user.id)
+    """List all assessments (not restricted by user)"""
+    query = db.query(Assessment)
     
     # Apply filters
     if status_filter:
@@ -136,7 +136,7 @@ async def get_assessment_report(
         db.query(Assessment)
         .filter(
             Assessment.id == assessment_uuid,
-            Assessment.user_id == current_user.id,
+            # Assessment.user_id == current_user.id,
         )
         .options(
             selectinload(Assessment.objects),
@@ -168,7 +168,7 @@ async def update_assessment(
     
     assessment = db.query(Assessment).filter(
         Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
+        # Assessment.user_id == current_user.id
     ).first()
     
     if not assessment:
@@ -233,7 +233,7 @@ async def run_assessment_analysis(
     
     assessment = db.query(Assessment).filter(
         Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
+        # Assessment.user_id == current_user.id
     ).first()
     
     if not assessment:
