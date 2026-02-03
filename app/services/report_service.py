@@ -123,6 +123,82 @@ def _build_by_complexity(
     }
 
 
+# Linear weights for overall complexity: low=1, medium=2, high=3, critical=4
+COMPLEXITY_WEIGHTS = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _overall_complexity_linear(stats: dict[str, int]) -> Optional[str]:
+    """
+    Compute overall complexity from counts by level using a linear weighted model.
+    Weighted average = (low*1 + medium*2 + high*3 + critical*4) / total.
+    Map average to label: [1, 1.5) Low, [1.5, 2.5) Medium, [2.5, 3.5) High, [3.5, 4] Critical.
+    """
+    total = sum(stats.get(level, 0) for level in COMPLEXITY_LEVELS)
+    if total == 0:
+        return None
+    weighted_sum = sum(
+        COMPLEXITY_WEIGHTS.get(level, 0) * stats.get(level, 0) for level in COMPLEXITY_LEVELS
+    )
+    avg = weighted_sum / total
+    if avg < 1.5:
+        return "Low"
+    if avg < 2.5:
+        return "Medium"
+    if avg < 3.5:
+        return "High"
+    return "Critical"
+
+
+def _union_root_counts(
+    complexity_to_dash_roots: dict[str, set[Any]],
+    complexity_to_report_roots: dict[str, set[Any]],
+) -> tuple[int, int]:
+    """Return (distinct dashboards containing any level, distinct reports containing any level)."""
+    union_dash: set[Any] = set()
+    union_report: set[Any] = set()
+    for level in COMPLEXITY_LEVELS:
+        union_dash |= complexity_to_dash_roots.get(level, set())
+        union_report |= complexity_to_report_roots.get(level, set())
+    return len(union_dash), len(union_report)
+
+
+def _final_overall_complexity_weighted(
+    sections: dict[str, Any],
+    config: list[tuple[str, str]],
+) -> Optional[str]:
+    """
+    Final overall complexity: linear weighted average by count across sections (Option 1).
+    Each section's overall_complexity (Low=1, Medium=2, High=3, Critical=4) is weighted by its total count.
+    Map weighted average to label using same bands as _overall_complexity_linear.
+    """
+    weighted_sum = 0
+    total_count = 0
+    for section_key, total_key in config:
+        section = sections.get(section_key) or {}
+        count = int(section.get(total_key) or 0)
+        if count <= 0:
+            continue
+        raw = (section.get("overall_complexity") or "").strip()
+        if not raw:
+            continue
+        level_key = raw.lower()
+        w = COMPLEXITY_WEIGHTS.get(level_key)
+        if w is None:
+            continue
+        weighted_sum += w * count
+        total_count += count
+    if total_count == 0:
+        return None
+    avg = weighted_sum / total_count
+    if avg < 1.5:
+        return "Low"
+    if avg < 2.5:
+        return "Medium"
+    if avg < 3.5:
+        return "High"
+    return "Critical"
+
+
 # =============================================================================
 # CONTAINMENT TREE
 # =============================================================================
@@ -582,6 +658,42 @@ class ReportService:
                 "reports_percent": pct_reports,
             })
 
+        # Overall key findings: per feature area use overall_complexity (linear), total count, and
+        # total % of dashboards/reports containing any (union across complexity levels).
+        overall_key_findings_config = [
+            ("visualization", "visualization_details", "total_visualization", "Visualization"),
+            ("dashboard", "dashboards_breakdown", "total_dashboards", "Dashboard"),
+            ("report", "reports_breakdown", "total_reports", "Report"),
+            ("calculated_field", "calculated_fields_breakdown", "total_calculated_fields", "Calculated Field"),
+            ("filter", "filters_breakdown", "total_filters", "Filter"),
+            ("measure", "measures_breakdown", "total_measures", "Measure"),
+            ("dimension", "dimensions_breakdown", "total_dimensions", "Dimension"),
+            ("parameter", "parameters_breakdown", "total_parameters", "Parameter"),
+            ("sort", "sorts_breakdown", "total_sorts", "Sort"),
+            ("prompt", "prompts_breakdown", "total_prompts", "Prompt"),
+            ("query", "queries_breakdown", "total_queries", "Query"),
+        ]
+        overall_key_findings: list[dict[str, Any]] = []
+        for _entity_name, section_key, total_key, feature_area_display in overall_key_findings_config:
+            section = sections.get(section_key) or {}
+            count = int(section.get(total_key) or 0)
+            if count == 0:
+                continue
+            overall_complexity_val = (section.get("overall_complexity") or "").strip() or "Unknown"
+            dash_any = int(section.get("dashboards_containing_any_count") or 0)
+            report_any = int(section.get("reports_containing_any_count") or 0)
+            pct_dash = round(100.0 * dash_any / total_dashboards, 1) if total_dashboards else 0.0
+            pct_reports = round(100.0 * report_any / total_reports, 1) if total_reports else 0.0
+            overall_key_findings.append({
+                "feature_area": feature_area_display,
+                "complexity": overall_complexity_val,
+                "count": count,
+                "dashboards_summary": f"Used in {pct_dash:.1f}% of Dashboards",
+                "reports_summary": f"Used in {pct_reports:.1f}% of Reports",
+                "dashboards_percent": pct_dash,
+                "reports_percent": pct_reports,
+            })
+
         # High-level complexity overview by complexity level (Visualization, Dashboard, Report)
         high_level_complexity_overview: list[dict[str, Any]] = []
         viz_items = complex_analysis.get("visualization") or []
@@ -597,6 +709,25 @@ class ReportService:
                 "dashboard_count": dash_item.get("dashboards_containing_count") or 0,
                 "report_count": report_item.get("reports_containing_count") or 0,
             })
+
+        # Final overall complexity: linear weighted average by count across sections (Option 1)
+        final_overall_config = [
+            ("visualization_details", "total_visualization"),
+            ("dashboards_breakdown", "total_dashboards"),
+            ("reports_breakdown", "total_reports"),
+            ("calculated_fields_breakdown", "total_calculated_fields"),
+            # ("filters_breakdown", "total_filters"),
+            # ("measures_breakdown", "total_measures"),
+            # ("dimensions_breakdown", "total_dimensions"),
+            # ("parameters_breakdown", "total_parameters"),
+            # ("sorts_breakdown", "total_sorts"),
+            # ("prompts_breakdown", "total_prompts"),
+            # ("queries_breakdown", "total_queries"),
+            # ("packages_breakdown", "total_packages"),
+            # ("data_source_connections_breakdown", "total_unique_connections"),
+            # ("data_modules_breakdown", "total_data_modules"),
+        ]
+        overall_complexity = _final_overall_complexity_weighted(sections, final_overall_config)
 
         # Inventory: total count of each asset type (Dashboard, Report, Visualization, etc.)
         def _section_total(section_key: str, total_key: str) -> int:
@@ -621,6 +752,8 @@ class ReportService:
 
         return {
             "key_findings": key_findings,
+            "overall_key_findings": overall_key_findings,
+            "overall_complexity": overall_complexity,
             "high_level_complexity_overview": high_level_complexity_overview,
             "inventory": inventory,
         }
@@ -1032,13 +1165,19 @@ class ReportService:
         
         stats = _build_complexity_stats(items)
         by_complexity = tracker.build_by_complexity(count_key)
-        
+        overall_complexity = _overall_complexity_linear(stats)
+        dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
+            tracker.dash_roots, tracker.report_roots
+        )
         total_key = f"total_{object_type}s"
         return {
             total_key: len(items),
+            "overall_complexity": overall_complexity,
             "stats": stats,
             f"{object_type}s": items,
             "by_complexity": by_complexity,
+            "dashboards_containing_any_count": dashboards_containing_any_count,
+            "reports_containing_any_count": reports_containing_any_count,
         }
 
     # -------------------------------------------------------------------------
@@ -1143,13 +1282,16 @@ class ReportService:
             if c in stats:
                 stats[c] += cnt
         
-        overall_complexity = None
+        overall_complexity = _overall_complexity_linear(stats)
         # By complexity: visualization count and distinct dashboards/reports containing that complexity
         by_complexity = _build_by_complexity(
             "visualization_count", 
             stats, 
             complexity_to_dash_roots, 
             complexity_to_report_roots
+        )
+        dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
+            complexity_to_dash_roots, complexity_to_report_roots
         )
 
         return {
@@ -1158,6 +1300,8 @@ class ReportService:
             "stats": stats,
             "by_complexity": by_complexity,
             "breakdown": breakdown,
+            "dashboards_containing_any_count": dashboards_containing_any_count,
+            "reports_containing_any_count": reports_containing_any_count,
         }
 
     # -------------------------------------------------------------------------
@@ -1259,7 +1403,8 @@ class ReportService:
             dash_obj = id_to_obj.get(dash_id)
             name = (dash_obj.name if dash_obj else None) or str(dash_id)
             counts: dict[str, int] = defaultdict(int)
-            
+            viz_type_names: set[str] = set()
+
             for oid in member_ids:
                 obj = id_to_obj.get(oid)
                 if not obj:
@@ -1267,7 +1412,10 @@ class ReportService:
                 ot = _normalize_object_type(obj.object_type)
                 if self._is_visualization_object(obj):
                     counts["visualizations"] += 1
-                    key = (self._get_visualization_type_for_object(obj) or "").strip().lower()
+                    viz_type = self._get_visualization_type_for_object(obj)
+                    if viz_type and (viz_type or "").strip():
+                        viz_type_names.add((viz_type or "").strip())
+                    key = (viz_type or "").strip().lower()
                     info = viz_complexity_lookup.get(key) or {}
                     c = ((info.get("complexity") or "") or "").strip().lower()
                     if c in COMPLEXITY_LEVELS:
@@ -1289,13 +1437,16 @@ class ReportService:
             
             viz_by_complexity = {level: counts[f"visualizations_{level}"] for level in COMPLEXITY_LEVELS}
             dashboard_complexity = self._derive_complexity_from_viz(viz_by_complexity)
-            
+            visualization_overall_complexity = _overall_complexity_linear(viz_by_complexity)
+
             dashboards_list.append({
                 "dashboard_id": str(dash_id),
                 "dashboard_name": name,
                 "complexity": dashboard_complexity,
                 "total_visualizations": counts["visualizations"],
                 "visualizations_by_complexity": viz_by_complexity,
+                "visualization_overall_complexity": visualization_overall_complexity,
+                "visualization_type_names": sorted(viz_type_names),
                 "total_tabs": counts["tabs"],
                 "total_measures": counts["measures"],
                 "total_dimensions": counts["dimensions"],
@@ -1307,11 +1458,14 @@ class ReportService:
         
         total_dashboards = len(dashboard_to_ids)
         dashboard_stats = _build_complexity_stats(dashboards_list)
-        
+        overall_complexity = _overall_complexity_linear(dashboard_stats)
         return {
             "total_dashboards": total_dashboards,
+            "overall_complexity": overall_complexity,
             "stats": dashboard_stats,
             "dashboards": dashboards_list,
+            "dashboards_containing_any_count": total_dashboards,
+            "reports_containing_any_count": 0,
         }
     
     # -------------------------------------------------------------------------
@@ -1684,7 +1838,8 @@ class ReportService:
             name = (report_obj.name if report_obj else None) or str(report_id)
             report_type = self._get_report_type(report_obj) if report_obj else "report"
             counts: dict[str, int] = defaultdict(int)
-            
+            viz_type_names: set[str] = set()
+
             for oid in member_ids:
                 obj = id_to_obj.get(oid)
                 if not obj:
@@ -1692,7 +1847,10 @@ class ReportService:
                 ot = _normalize_object_type(obj.object_type)
                 if self._is_visualization_object(obj):
                     counts["visualizations"] += 1
-                    key = (self._get_visualization_type_for_object(obj) or "").strip().lower()
+                    viz_type = self._get_visualization_type_for_object(obj)
+                    if viz_type and (viz_type or "").strip():
+                        viz_type_names.add((viz_type or "").strip())
+                    key = (viz_type or "").strip().lower()
                     info = viz_complexity_lookup.get(key) or {}
                     c = ((info.get("complexity") or "") or "").strip().lower()
                     if c in COMPLEXITY_LEVELS:
@@ -1740,6 +1898,7 @@ class ReportService:
                 report_complexity = "Critical"
             else:
                 report_complexity = self._derive_complexity_from_viz(viz_by_complexity)
+            visualization_overall_complexity = _overall_complexity_linear(viz_by_complexity)
 
             reports_list.append({
                 "report_id": str(report_id),
@@ -1748,6 +1907,8 @@ class ReportService:
                 "complexity": report_complexity,
                 "total_visualizations": counts["visualizations"],
                 "visualizations_by_complexity": viz_by_complexity,
+                "visualization_type_names": sorted(viz_type_names),
+                "visualization_overall_complexity": visualization_overall_complexity,
                 "calculated_fields_by_complexity": calculated_fields_by_complexity,
                 "total_pages": counts["pages"],
                 "total_data_modules": len(report_to_data_modules.get(report_id, set())),
@@ -1766,11 +1927,14 @@ class ReportService:
         
         total_reports = len(report_to_ids)
         report_stats = _build_complexity_stats(reports_list)
-        
+        overall_complexity = _overall_complexity_linear(report_stats)
         return {
             "total_reports": total_reports,
+            "overall_complexity": overall_complexity,
             "stats": report_stats,
             "reports": reports_list,
+            "dashboards_containing_any_count": 0,
+            "reports_containing_any_count": total_reports,
         }
 
     # -------------------------------------------------------------------------
@@ -1931,9 +2095,10 @@ class ReportService:
         
         total_packages = len(packages_list)
         _stats = _build_complexity_stats(packages_list)
-        
+        overall_complexity = _overall_complexity_linear(_stats)
         return {
             "total_packages": total_packages,
+            "overall_complexity": overall_complexity,
             "stats": _stats,
             "packages": packages_list,
         }
@@ -2075,12 +2240,14 @@ class ReportService:
             })
 
         _stats = {"low": 0, "medium": len(connections_list), "high": 0, "critical": 0}
+        overall_complexity = _overall_complexity_linear(_stats)
         return {
             "total_data_sources": total_data_sources,
             "total_data_source_connections": total_data_source_connections,
             "total_unique_connections": total_unique_connections,
             "total_data_modules": total_data_modules,
             "total_packages": total_packages,
+            "overall_complexity": overall_complexity,
             "stats": _stats,
             "connections": connections_list,
         }
@@ -2101,6 +2268,7 @@ class ReportService:
             expr_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
             return self._calculated_field_complexity(calc_type, expr_raw)
         
+        # Parser (data_module_extractor) emits: expression, calculation_type, cognosClass.
         result = self._get_generic_breakdown(
             objects=objects,
             tree=tree,
@@ -2112,10 +2280,32 @@ class ReportService:
             prop_keys=["expression", "calculation_type", "cognosClass"],
             preview_len=500,
         )
-        
-        # Adjust key names for backward compatibility
-        result["total_calculated_fields"] = result.pop("total_calculated_fields")
-        result["calculated_fields"] = result.pop("calculated_fields")
+        # Items with same name, expression, and calculation_type should be grouped together
+        items = result["calculated_fields"]
+        group_key_to_items: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+        for it in items:
+            key = (it["name"], it.get("expression", ""), it.get("calculation_type", ""))
+            group_key_to_items[key].append(it)
+        grouped: list[dict[str, Any]] = []
+        for group in group_key_to_items.values():
+            first = group[0]
+            merged = {
+                "calculated_field_id": first["calculated_field_id"],
+                "calculated_field_ids": [x["calculated_field_id"] for x in group],
+                "name": first["name"],
+                "expression": first.get("expression"),
+                "calculation_type": first.get("calculation_type"),
+                "complexity": max((x.get("complexity") or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first.get("complexity"),
+                "dashboards_containing_count": max(x["dashboards_containing_count"] for x in group),
+                "reports_containing_count": max(x["reports_containing_count"] for x in group),
+            }
+            for k, v in first.items():
+                if k not in ("calculated_field_id", "name", "expression", "calculation_type", "complexity", "dashboards_containing_count", "reports_containing_count"):
+                    merged[k] = v
+            grouped.append(merged)
+        result["calculated_fields"] = grouped
+        result["total_calculated_fields"] = len(grouped)
+        result["stats"] = _build_complexity_stats(grouped)
         return result
 
     # -------------------------------------------------------------------------
@@ -2361,10 +2551,12 @@ class ReportService:
                 main_modules_list.append(item)
 
         _stats = {"low": 0, "medium": len(modules_list), "high": 0, "critical": 0}
+        overall_complexity = _overall_complexity_linear(_stats)
         return {
             "total_data_modules": total_data_modules,
             "total_main_data_modules": total_main_data_modules,
             "total_unique_modules": total_unique_modules,
+            "overall_complexity": overall_complexity,
             "stats": _stats,
             "data_modules": modules_list,
             "main_data_modules": main_modules_list,
@@ -2434,8 +2626,19 @@ class ReportService:
         
         _stats = _build_complexity_stats(items)
         by_complexity = tracker.build_by_complexity("query_count")
-        
-        return {"total_queries": len(items), "stats": _stats, "queries": items, "by_complexity": by_complexity}
+        overall_complexity = _overall_complexity_linear(_stats)
+        dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
+            tracker.dash_roots, tracker.report_roots
+        )
+        return {
+            "total_queries": len(items),
+            "overall_complexity": overall_complexity,
+            "stats": _stats,
+            "queries": items,
+            "by_complexity": by_complexity,
+            "dashboards_containing_any_count": dashboards_containing_any_count,
+            "reports_containing_any_count": reports_containing_any_count,
+        }
 
     # -------------------------------------------------------------------------
     # Measures Breakdown
@@ -2495,9 +2698,48 @@ class ReportService:
                 "dashboards_containing_count": dashboards_count,
                 "reports_containing_count": reports_count,
             })
-        
+
+        # items having the same name, aggregation, and expression should be grouped together
+        group_key_to_items: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+        for it in items:
+            key = (it["name"], it["aggregation"], it.get("expression", ""))
+            group_key_to_items[key].append(it)
+        grouped: list[dict[str, Any]] = []
+        for group in group_key_to_items.values():
+            first = group[0]
+            merged = {
+                "measure_id": first["measure_id"],
+                "measure_ids": [x["measure_id"] for x in group],
+                "name": first["name"],
+                "aggregation": first["aggregation"],
+                "is_simple": first["is_simple"],
+                "is_complex": first["is_complex"],
+                "parent_module_id": first["parent_module_id"],
+                "parent_module_name": first["parent_module_name"],
+                "complexity": max((x["complexity"] or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first["complexity"],
+                "dashboards_containing_count": max(x["dashboards_containing_count"] for x in group),
+                "reports_containing_count": max(x["reports_containing_count"] for x in group),
+            }
+            for k, v in first.items():
+                if k not in ("measure_id", "name", "aggregation", "is_simple", "is_complex", "parent_module_id", "parent_module_name", "complexity", "dashboards_containing_count", "reports_containing_count"):
+                    merged[k] = v
+            grouped.append(merged)
+        items = grouped
+
+        _stats = _build_complexity_stats(items)
         by_complexity = tracker.build_by_complexity("measure_count")
-        return {"total_measures": len(items), "measures": items, "by_complexity": by_complexity}
+        overall_complexity = _overall_complexity_linear(_stats)
+        dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
+            tracker.dash_roots, tracker.report_roots
+        )
+        return {
+            "total_measures": len(items),
+            "overall_complexity": overall_complexity,
+            "measures": items,
+            "by_complexity": by_complexity,
+            "dashboards_containing_any_count": dashboards_containing_any_count,
+            "reports_containing_any_count": reports_containing_any_count,
+        }
 
     # -------------------------------------------------------------------------
     # Dimensions Breakdown
@@ -2557,6 +2799,46 @@ class ReportService:
                 "dashboards_containing_count": dashboards_count,
                 "reports_containing_count": reports_count,
             })
+
         
+        # items having the same name, usage, and expression should be grouped together
+        group_key_to_items: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+        for it in items:
+            key = (it["name"], it.get("usage"), it.get("expression", ""))
+            group_key_to_items[key].append(it)
+        grouped: list[dict[str, Any]] = []
+        for group in group_key_to_items.values():
+            first = group[0]
+            merged = {
+                "dimension_id": first["dimension_id"],
+                "dimension_ids": [x["dimension_id"] for x in group],
+                "name": first["name"],
+                "usage": first.get("usage"),
+                "is_simple": first["is_simple"],
+                "is_complex": first["is_complex"],
+                "parent_module_id": first["parent_module_id"],
+                "parent_module_name": first["parent_module_name"],
+                "complexity": max((x["complexity"] or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first["complexity"],
+                "dashboards_containing_count": max(x["dashboards_containing_count"] for x in group),
+                "reports_containing_count": max(x["reports_containing_count"] for x in group),
+            }
+            for k, v in first.items():
+                if k not in ("dimension_id", "name", "usage", "is_simple", "is_complex", "parent_module_id", "parent_module_name", "complexity", "dashboards_containing_count", "reports_containing_count"):
+                    merged[k] = v
+            grouped.append(merged)
+        items = grouped
+
+        _stats = _build_complexity_stats(items)
         by_complexity = tracker.build_by_complexity("dimension_count")
-        return {"total_dimensions": len(items), "dimensions": items, "by_complexity": by_complexity}
+        overall_complexity = _overall_complexity_linear(_stats)
+        dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
+            tracker.dash_roots, tracker.report_roots
+        )
+        return {
+            "total_dimensions": len(items),
+            "overall_complexity": overall_complexity,
+            "dimensions": items,
+            "by_complexity": by_complexity,
+            "dashboards_containing_any_count": dashboards_containing_any_count,
+            "reports_containing_any_count": reports_containing_any_count,
+        }

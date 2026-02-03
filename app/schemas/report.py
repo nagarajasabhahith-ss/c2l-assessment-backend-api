@@ -89,6 +89,8 @@ class DimensionByComplexityItem(BaseModel):
 
 class VisualizationDetails(BaseModel):
     total_visualization: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     by_complexity: Dict[str, VisualizationByComplexityItem] = Field(default_factory=dict)
     breakdown: list[VisualizationBreakdownItem]
@@ -103,6 +105,10 @@ class DashboardBreakdownItem(BaseModel):
     visualizations_by_complexity: VisualizationComplexityStats = Field(
         default_factory=lambda: VisualizationComplexityStats()
     )
+    """Weighted average of visualization complexities in this dashboard (linear: low=1, medium=2, high=3, critical=4)."""
+    visualization_overall_complexity: Optional[str] = None
+    """Viz type names used in this dashboard (e.g. Pie, Bar, Line)."""
+    visualization_type_names: List[str] = Field(default_factory=list)
     total_tabs: int = 0
     total_measures: int = 0
     total_dimensions: int = 0
@@ -114,6 +120,8 @@ class DashboardBreakdownItem(BaseModel):
 
 class DashboardsBreakdown(BaseModel):
     total_dashboards: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     """Count of dashboards by derived complexity (low, medium, high, critical)."""
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     dashboards: list[DashboardBreakdownItem]
@@ -133,6 +141,8 @@ class ReportBreakdownItem(BaseModel):
     calculated_fields_by_complexity: VisualizationComplexityStats = Field(
         default_factory=lambda: VisualizationComplexityStats()
     )
+    """Viz type names used in this report (e.g. Pie, Bar, Line)."""
+    visualization_type_names: List[str] = Field(default_factory=list)
     total_pages: int = 0
     total_data_modules: int = 0
     total_packages: int = 0
@@ -150,6 +160,8 @@ class ReportBreakdownItem(BaseModel):
 
 class ReportsBreakdown(BaseModel):
     total_reports: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     """Count of reports by derived complexity (low, medium, high, critical)."""
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     reports: list[ReportBreakdownItem]
@@ -173,6 +185,8 @@ class PackageBreakdownItem(BaseModel):
 
 class PackagesBreakdown(BaseModel):
     total_packages: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     packages: list[PackageBreakdownItem]
 
@@ -200,6 +214,8 @@ class DataSourceConnectionsBreakdown(BaseModel):
     total_unique_connections: int
     total_data_modules: int
     total_packages: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     connections: list[DataSourceConnectionBreakdownItem]
 
@@ -222,6 +238,8 @@ class CalculatedFieldBreakdownItem(BaseModel):
 
 class CalculatedFieldsBreakdown(BaseModel):
     total_calculated_fields: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     calculated_fields: list[CalculatedFieldBreakdownItem]
     """Per-complexity: calculated field count and distinct dashboards/reports containing that complexity (for complex_analysis.calculated_field)."""
     by_complexity: Dict[str, CalculatedFieldByComplexityItem] = Field(default_factory=dict)
@@ -257,6 +275,8 @@ class FilterBreakdownItem(BaseModel):
 
 class FiltersBreakdown(BaseModel):
     total_filters: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     filters: list[FilterBreakdownItem]
     """Per-complexity: filter count and distinct dashboards/reports containing that complexity (for complex_analysis.filter)."""
@@ -289,6 +309,8 @@ class ParameterByComplexityItem(BaseModel):
 
 class ParametersBreakdown(BaseModel):
     total_parameters: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     parameters: list[ParameterBreakdownItem]
     by_complexity: Dict[str, ParameterByComplexityItem] = Field(default_factory=dict)
@@ -321,6 +343,8 @@ class SortByComplexityItem(BaseModel):
 
 class SortsBreakdown(BaseModel):
     total_sorts: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     sorts: list[SortBreakdownItem]
     by_complexity: Dict[str, SortByComplexityItem] = Field(default_factory=dict)
@@ -352,6 +376,8 @@ class PromptByComplexityItem(BaseModel):
 
 class PromptsBreakdown(BaseModel):
     total_prompts: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     prompts: list[PromptBreakdownItem]
     by_complexity: Dict[str, PromptByComplexityItem] = Field(default_factory=dict)
@@ -387,6 +413,8 @@ class QueryByComplexityItem(BaseModel):
 
 class QueriesBreakdown(BaseModel):
     total_queries: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     queries: list[QueryBreakdownItem]
     by_complexity: Dict[str, QueryByComplexityItem] = Field(default_factory=dict)
@@ -412,6 +440,8 @@ class MeasureBreakdownItem(BaseModel):
 
 class MeasuresBreakdown(BaseModel):
     total_measures: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     measures: list[MeasureBreakdownItem]
 
 
@@ -434,6 +464,8 @@ class DimensionBreakdownItem(BaseModel):
 
 class DimensionsBreakdown(BaseModel):
     total_dimensions: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     dimensions: list[DimensionBreakdownItem]
 
 
@@ -465,6 +497,8 @@ class DataModulesBreakdown(BaseModel):
     total_data_modules: int
     total_main_data_modules: int = 0  # module, dataModule, model only (excludes smartsModule, modelView, dataSet2)
     total_unique_modules: int
+    """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
+    overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
     data_modules: list[DataModuleBreakdownItem]
     main_data_modules: list[DataModuleBreakdownItem] = Field(default_factory=list)  # main-only list (module, dataModule, model)
@@ -530,6 +564,10 @@ class InventoryItem(BaseModel):
 class Summary(BaseModel):
     """Report summary with key findings, high-level complexity overview, and inventory."""
     key_findings: List[KeyFinding] = Field(default_factory=list)
+    """Per feature area: overall_complexity (linear), total count, and % of dashboards/reports containing any (union)."""
+    overall_key_findings: List[KeyFinding] = Field(default_factory=list)
+    """Final overall complexity: linear weighted average by count across all sections (Option 1)."""
+    overall_complexity: Optional[str] = None
     high_level_complexity_overview: List[HighLevelComplexityOverviewItem] = Field(default_factory=list)
     inventory: List[InventoryItem] = Field(default_factory=list)
 
