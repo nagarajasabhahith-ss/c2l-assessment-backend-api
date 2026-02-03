@@ -45,11 +45,7 @@ async def list_objects(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    # Verify assessment access
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -80,11 +76,7 @@ async def get_object(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ID format")
         
-    # Verify assessment access
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -115,11 +107,7 @@ async def list_relationships(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
         
-    # Verify assessment access
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -160,11 +148,7 @@ async def get_assessment_stats(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    # Verify assessment access
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")

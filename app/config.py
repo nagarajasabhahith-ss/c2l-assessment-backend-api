@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     # Optional: fully qualified table for complexity/feature lookup used by report service (dataset.table or project.dataset.table)
     BIGQUERY_FEATURE_TABLE: str = ""
 
-    # Google Cloud Storage (optional – uploads go to GCS when set)
+    # Google Cloud Storage (required for file uploads)
     GCS_BUCKET: str = ""
     GCS_PREFIX: str = "uploads"  # Object key prefix, e.g. uploads/assessment_id/file_id.zip
     GCS_CREDENTIALS_PATH: str = ""  # Path to service account JSON; or set GOOGLE_APPLICATION_CREDENTIALS

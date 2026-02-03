@@ -1,8 +1,8 @@
 """
-Storage abstraction: local filesystem or Google Cloud Storage.
+Storage: file uploads go to Google Cloud Storage (GCS).
 
-When GCS_BUCKET is set, uploads go to GCS and file_path is stored as gs://bucket/key.
-When not set, files are stored under UPLOAD_DIR as before.
+Requires GCS_BUCKET to be set. Stored paths are gs://bucket/key.
+Delete and get_local_path support both gs:// URIs and legacy local paths.
 """
 
 import os
@@ -54,21 +54,25 @@ def upload_file(
     content: bytes,
 ) -> str:
     """
-    Store file and return the stored path (local path or gs://...).
-    Uses GCS when settings.gcs_enabled else local UPLOAD_DIR.
+    Store file in GCS and return the gs:// path.
+    Requires GCS_BUCKET to be set; raises if GCS client cannot be initialized.
     """
+    if not settings.gcs_enabled:
+        raise RuntimeError(
+            "File uploads require GCS. Set GCS_BUCKET (and optionally GCS_CREDENTIALS_PATH or GOOGLE_APPLICATION_CREDENTIALS)."
+        )
+    client = _get_gcs_client()
+    if client is None:
+        raise RuntimeError(
+            "GCS is configured but client could not be initialized. "
+            "Check GCS_CREDENTIALS_PATH or GOOGLE_APPLICATION_CREDENTIALS."
+        )
     safe_filename = f"{file_id}{ext}"
-    if settings.gcs_enabled:
-        client = _get_gcs_client()
-        if client is None:
-            # Fallback to local if GCS client failed
-            return _upload_local(assessment_id, safe_filename, content)
-        bucket = client.bucket(settings.GCS_BUCKET)
-        blob_name = f"{settings.GCS_PREFIX.strip('/')}/{assessment_id}/{safe_filename}"
-        blob = bucket.blob(blob_name)
-        blob.upload_from_string(content, content_type="application/octet-stream")
-        return f"gs://{settings.GCS_BUCKET}/{blob_name}"
-    return _upload_local(assessment_id, safe_filename, content)
+    bucket = client.bucket(settings.GCS_BUCKET)
+    blob_name = f"{settings.GCS_PREFIX.strip('/')}/{assessment_id}/{safe_filename}"
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(content, content_type="application/octet-stream")
+    return f"gs://{settings.GCS_BUCKET}/{blob_name}"
 
 
 def _upload_local(assessment_id: str, safe_filename: str, content: bytes) -> str:

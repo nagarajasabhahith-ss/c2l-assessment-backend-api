@@ -47,11 +47,7 @@ async def list_errors(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    # Verify assessment access
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")

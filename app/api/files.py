@@ -75,7 +75,14 @@ async def upload_files(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Upload one or more files to an assessment (local disk or Google Cloud Storage when GCS_BUCKET is set)."""
+    """Upload one or more files to an assessment. Files are stored in Google Cloud Storage (GCS_BUCKET required)."""
+
+    # Require GCS for uploads
+    if not settings.gcs_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="File uploads are not available: GCS is not configured. Set GCS_BUCKET (and credentials) in the environment.",
+        )
 
     # Validate assessment
     try:
@@ -83,18 +90,10 @@ async def upload_files(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
-    
-    # Create assessment directory when using local storage (for GCS it's not used)
-    if not settings.gcs_enabled:
-        assessment_dir = Path(settings.UPLOAD_DIR) / str(assessment_id)
-        assessment_dir.mkdir(parents=True, exist_ok=True)
     
     uploaded = []
     failed = []
@@ -145,7 +144,7 @@ async def upload_files(
                 assessment.usage_stats = usage_data
                 db.commit()
             
-            uploaded.append(UploadedFileResponse.from_orm(uploaded_file))
+            uploaded.append(UploadedFileResponse.model_validate(uploaded_file))
             
         except Exception as e:
             failed.append({
@@ -172,10 +171,7 @@ async def list_files(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -184,7 +180,7 @@ async def list_files(
         UploadedFile.assessment_id == assessment_uuid
     ).order_by(UploadedFile.uploaded_at.desc()).all()
     
-    return [UploadedFileResponse.from_orm(f) for f in files]
+    return [UploadedFileResponse.model_validate(f) for f in files]
 
 
 @router.delete("/files/{file_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -204,10 +200,9 @@ async def delete_file(
     if not uploaded_file:
         raise HTTPException(status_code=404, detail="File not found")
     
-    # Check ownership
+    # Verify assessment exists (any logged-in user can delete files from any assessment)
     assessment = db.query(Assessment).filter(
-        Assessment.id == uploaded_file.assessment_id,
-        Assessment.user_id == current_user.id
+        Assessment.id == uploaded_file.assessment_id
     ).first()
     
     if not assessment:

@@ -1,4 +1,6 @@
 import logging
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
@@ -19,14 +21,29 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# Configure CORS
+# Configure CORS (primary)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
+
+
+class EnsureCORSHeadersMiddleware(BaseHTTPMiddleware):
+    """Ensure CORS headers are on every response (including 500/errors) so browser shows real error."""
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        origin = request.headers.get("origin")
+        if origin and origin in settings.CORS_ORIGINS:
+            response.headers.setdefault("Access-Control-Allow-Origin", origin)
+            response.headers.setdefault("Access-Control-Allow-Credentials", "true")
+        return response
+
+
+app.add_middleware(EnsureCORSHeadersMiddleware)
 
 
 @app.on_event("startup")

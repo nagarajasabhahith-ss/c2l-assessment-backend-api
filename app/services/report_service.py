@@ -16,7 +16,7 @@ import sys
 # BigQuery: feature list for individual complexity (Visualization, etc.)
 FEATURE_LIST_QUERY = (
     "SELECT feature_area, feature, complexity, feasibility, description, recommended "
-    "FROM `tableau-to-looker-migration.C2L_Complexity_Rules.Feature_List_Looker_Perspective` "
+    "FROM `tableau-to-looker-migration.C2L_Complexity_Rules.Looker_Perspective` "
     "LIMIT 1000"
 )
 FEATURE_AREA_VISUALIZATION = "Visualization"
@@ -24,7 +24,7 @@ FEATURE_AREA_VISUALIZATION = "Visualization"
 # BigQuery: complex analysis feature lookup (feature_area + complexity -> feature)
 COMPLEX_ANALYSIS_FEATURE_QUERY = (
     "SELECT feature_area, feature, complexity, `order` "
-    "FROM `tableau-to-looker-migration.C2L_Complexity_Rules.Complex_Analysis_Feature` "
+    "FROM `tableau-to-looker-migration.C2L_Complexity_Rules.Complex_Rules` "
     "LIMIT 1000"
 )
 

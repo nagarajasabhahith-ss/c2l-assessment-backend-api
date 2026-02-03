@@ -31,7 +31,7 @@ async def create_assessment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Create a new assessment"""
+    """Create a new assessment (owned by current user)"""
     assessment = Assessment(
         name=assessment_data.name,
         bi_tool=assessment_data.bi_tool,
@@ -44,7 +44,7 @@ async def create_assessment(
     db.refresh(assessment)
     
     # Add counts
-    response = AssessmentResponse.from_orm(assessment)
+    response = AssessmentResponse.model_validate(assessment)
     response.files_count = 0
     response.objects_count = 0
     response.relationships_count = 0
@@ -60,7 +60,7 @@ async def list_assessments(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List all assessments (not restricted by user)"""
+    """List all assessments (any logged-in user can see all)."""
     query = db.query(Assessment)
     
     # Apply filters
@@ -72,12 +72,12 @@ async def list_assessments(
     
     # Pagination
     offset = (page - 1) * page_size
-    assessments = query.order_by(Assessment.created_at.desc()).offset(offset).limit(page_size).all()
+    assessments = query.order_by().offset(offset).limit(page_size).all()
     
     # Add counts for each assessment
     assessment_responses = []
     for assessment in assessments:
-        response = AssessmentResponse.from_orm(assessment)
+        response = AssessmentResponse.model_validate(assessment)
         response.files_count = len(assessment.files)
         response.objects_count = len(assessment.objects)
         response.relationships_count = len(assessment.relationships)
@@ -98,21 +98,18 @@ async def get_assessment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get a specific assessment"""
+    """Get a specific assessment (any logged-in user)."""
     try:
         assessment_uuid = uuid.UUID(assessment_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
     
-    response = AssessmentResponse.from_orm(assessment)
+    response = AssessmentResponse.model_validate(assessment)
     response.files_count = len(assessment.files)
     response.objects_count = len(assessment.objects)
     response.relationships_count = len(assessment.relationships)
@@ -126,7 +123,7 @@ async def get_assessment_report(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get the report for an assessment (visualization details, etc.). All data from API; no client-side computation."""
+    """Get the report for an assessment (any logged-in user)."""
     try:
         assessment_uuid = uuid.UUID(assessment_id)
     except ValueError:
@@ -134,10 +131,7 @@ async def get_assessment_report(
 
     assessment = (
         db.query(Assessment)
-        .filter(
-            Assessment.id == assessment_uuid,
-            # Assessment.user_id == current_user.id,
-        )
+        .filter(Assessment.id == assessment_uuid)
         .options(
             selectinload(Assessment.objects),
             selectinload(Assessment.relationships),
@@ -160,16 +154,13 @@ async def update_assessment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Update an assessment"""
+    """Update an assessment (any logged-in user)."""
     try:
         assessment_uuid = uuid.UUID(assessment_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        # Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -183,7 +174,7 @@ async def update_assessment(
     db.commit()
     db.refresh(assessment)
     
-    response = AssessmentResponse.from_orm(assessment)
+    response = AssessmentResponse.model_validate(assessment)
     response.files_count = len(assessment.files)
     response.objects_count = len(assessment.objects)
     response.relationships_count = len(assessment.relationships)
@@ -197,16 +188,13 @@ async def delete_assessment(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Delete an assessment and all related data"""
+    """Delete an assessment and all related data (any logged-in user)."""
     try:
         assessment_uuid = uuid.UUID(assessment_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -225,16 +213,13 @@ async def run_assessment_analysis(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Trigger analysis for an assessment"""
+    """Trigger analysis for an assessment (any logged-in user)."""
     try:
         assessment_uuid = uuid.UUID(assessment_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid assessment ID format")
     
-    assessment = db.query(Assessment).filter(
-        Assessment.id == assessment_uuid,
-        # Assessment.user_id == current_user.id
-    ).first()
+    assessment = db.query(Assessment).filter(Assessment.id == assessment_uuid).first()
     
     if not assessment:
         raise HTTPException(status_code=404, detail="Assessment not found")
@@ -262,4 +247,4 @@ async def run_assessment_analysis(
     report_service = ReportService(db)
     report_service.generate_report_for_assessment(updated_assessment)
 
-    return AssessmentResponse.from_orm(updated_assessment)
+    return AssessmentResponse.model_validate(updated_assessment)
