@@ -749,6 +749,19 @@ class ReportService:
             item["feature"] = feature_lookup.get(("report", level))
             complex_analysis["report"].append(item)
 
+        # Remove rows where the complexity level count is 0 for that feature area
+        for entity_name, items in list(complex_analysis.items()):
+            if entity_name == "dashboard":
+                count_key = "dashboards_containing_count"
+            elif entity_name == "report":
+                count_key = "reports_containing_count"
+            else:
+                count_key = f"{entity_name}_count"
+            complex_analysis[entity_name] = [
+                item for item in items
+                if (item.get(count_key) or 0) > 0
+            ]
+
         return complex_analysis
 
     def _build_summary(self, sections: dict[str, Any], complex_analysis: dict[str, Any]) -> dict[str, Any]:
