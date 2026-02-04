@@ -391,6 +391,8 @@ class QueryBreakdownItem(BaseModel):
     source_type: Optional[str] = None  # model, query_ref, sql
     is_simple: bool = False
     is_complex: bool = False
+    """True when this query backs a prompt (name contains 'prompt'); shown only in Queries, not duplicated in Prompts."""
+    is_prompt_query: bool = False
     report_id: Optional[str] = None
     report_name: Optional[str] = None
     cognos_class: Optional[str] = None
@@ -405,6 +407,16 @@ class QueryByComplexityItem(BaseModel):
     """Per-complexity: query count and distinct dashboards/reports containing that complexity."""
     complexity: str = "low"
     query_count: int = 0
+    dashboards_containing_count: int = 0
+    reports_containing_count: int = 0
+    """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
+    feature: Optional[str] = None
+
+
+class DataModuleByComplexityItem(BaseModel):
+    """Per-complexity: data module count and distinct dashboards/reports containing that complexity."""
+    complexity: str = "low"
+    data_module_count: int = 0
     dashboards_containing_count: int = 0
     reports_containing_count: int = 0
     """Feature from BigQuery Complex_Analysis_Feature (matched by feature_area & complexity)."""
@@ -500,6 +512,8 @@ class DataModulesBreakdown(BaseModel):
     """Overall complexity from linear weighted model (low=1, medium=2, high=3, critical=4)."""
     overall_complexity: Optional[str] = None
     stats: VisualizationComplexityStats = Field(default_factory=lambda: VisualizationComplexityStats())
+    """Per-complexity: data_module_count and dashboards/reports containing (for complex_analysis.data_module)."""
+    by_complexity: Dict[str, DataModuleByComplexityItem] = Field(default_factory=dict)
     data_modules: list[DataModuleBreakdownItem]
     main_data_modules: list[DataModuleBreakdownItem] = Field(default_factory=list)  # main-only list (module, dataModule, model)
 
@@ -534,6 +548,7 @@ class ComplexAnalysis(BaseModel):
     sort: List[SortByComplexityItem] = Field(default_factory=list)
     prompt: List[PromptByComplexityItem] = Field(default_factory=list)
     query: List[QueryByComplexityItem] = Field(default_factory=list)
+    data_module: List[DataModuleByComplexityItem] = Field(default_factory=list)
 
 
 class KeyFinding(BaseModel):
@@ -601,6 +616,98 @@ class AppendixResponse(BaseModel):
     reports: List[AppendixItem] = Field(default_factory=list)
 
 
+class FullDetailsCalculatedFieldItem(BaseModel):
+    id: str
+    name: str
+    expression: Optional[str] = None
+    calculation_type: Optional[str] = None
+    complexity: Optional[str] = None
+    class Config:
+        extra = "allow"
+
+
+class FullDetailsMeasureItem(BaseModel):
+    id: str
+    name: str
+    aggregation: Optional[str] = None
+    expression: Optional[str] = None
+    parent_module_name: Optional[str] = None
+    complexity: Optional[str] = None
+    class Config:
+        extra = "allow"
+
+
+class FullDetailsDimensionItem(BaseModel):
+    id: str
+    name: str
+    usage: Optional[str] = None
+    expression: Optional[str] = None
+    parent_module_name: Optional[str] = None
+    complexity: Optional[str] = None
+    class Config:
+        extra = "allow"
+
+
+class FullDetailsFilterItem(BaseModel):
+    id: str
+    name: str
+    expression: Optional[str] = None
+    filter_type: Optional[str] = None
+    filter_scope: Optional[str] = None
+    complexity: Optional[str] = None
+    class Config:
+        extra = "allow"
+
+
+class FullDetailsQueryItem(BaseModel):
+    id: str
+    name: str
+
+
+class FullDetailsColumnItem(BaseModel):
+    id: str
+    name: str
+
+
+class FullDetailsTabItem(BaseModel):
+    id: str
+    name: str
+
+
+class FullDetailsVisualizationItem(BaseModel):
+    """Per-widget: id, name, viz_type, data_items (itemId, itemLabel, modelRef from dashboard spec)."""
+    id: str
+    name: str
+    viz_type: str = "unknown"
+    data_items: List[Dict[str, Any]] = Field(default_factory=list)
+    class Config:
+        extra = "allow"
+
+
+class FullDetailsIdNameItem(BaseModel):
+    id: str
+    name: str
+    display_name: Optional[str] = None  # human name for data modules (e.g. from dashboard spec) when name is model id
+
+
+class FullDetailsByDashboardItem(BaseModel):
+    """Per-dashboard full details: tabs, visualizations (with data_items), measures, dimensions, filters, queries, columns, packages, data_modules, data_sources."""
+    dashboard_id: str
+    dashboard_name: str
+    viz_types: List[str] = Field(default_factory=list)
+    tabs: List[FullDetailsTabItem] = Field(default_factory=list)
+    visualizations: List[FullDetailsVisualizationItem] = Field(default_factory=list)
+    calculated_fields: List[FullDetailsCalculatedFieldItem] = Field(default_factory=list)
+    measures: List[FullDetailsMeasureItem] = Field(default_factory=list)
+    dimensions: List[FullDetailsDimensionItem] = Field(default_factory=list)
+    filters: List[FullDetailsFilterItem] = Field(default_factory=list)
+    queries: List[FullDetailsQueryItem] = Field(default_factory=list)
+    columns: List[FullDetailsColumnItem] = Field(default_factory=list)
+    packages: List[FullDetailsIdNameItem] = Field(default_factory=list)
+    data_modules: List[FullDetailsIdNameItem] = Field(default_factory=list)
+    data_sources: List[FullDetailsIdNameItem] = Field(default_factory=list)
+
+
 class AssessmentReportResponse(BaseModel):
     assessment_id: str
     sections: ReportSections
@@ -610,3 +717,5 @@ class AssessmentReportResponse(BaseModel):
     appendix: Optional[AppendixResponse] = None
     """Optional usage stats from usage_stats.json upload (usage_stats, content_creation, user_stats, performance, quick_wins, pilot_recommendations)."""
     usage_stats: Optional[Dict[str, Any]] = None
+    """Full details per dashboard: name, viz_types, calculated_fields, measures, dimensions, filters, queries, columns."""
+    full_details_by_dashboard: Optional[List[FullDetailsByDashboardItem]] = None

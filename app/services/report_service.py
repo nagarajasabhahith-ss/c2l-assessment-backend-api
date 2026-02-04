@@ -10,7 +10,9 @@ dashboard/report roots are resolved by traversing the graph (bottom-up or top-do
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Iterator, Optional
+import re
 import sys
 
 # BigQuery: feature list for individual complexity (Visualization, etc.)
@@ -55,12 +57,15 @@ except ImportError:
     })
 
 
-# Relationship types that mean "source contains target" (parser may store enum value or name)
-CONTAINMENT_REL_TYPES = frozenset({"contains", "parent_child"})
+# Relationship types that mean "source contains target" (parser may store enum value or name).
+# FILTERS_BY: report/data_module -> filter, so filter has a parent for get_root() resolution.
+CONTAINMENT_REL_TYPES = frozenset({"contains", "parent_child", "filters_by"})
 # Relationship types that mean "source uses/references target" (for bottom-to-top: target is data_module/package/data_source)
 USAGE_REL_TYPES = frozenset({"uses", "references", "connects_to"})
-# has_column: source = data_module, target = measure/column/dimension; follow reverse to reach data_module from contained items
+# has_column: source = table, target = measure/column/dimension; follow reverse to reach dashboard from measure/dimension
 HAS_COLUMN_REL_TYPE = "has_column"
+# For get_root(measure/dimension): also follow has_column (measure->table) and uses (dashboard->data_module) so we reach dashboard
+CONTAINMENT_OR_TRAVERSAL_REL_TYPES = CONTAINMENT_REL_TYPES | {HAS_COLUMN_REL_TYPE} | USAGE_REL_TYPES
 ROOT_OBJECT_TYPES = frozenset({"dashboard", "report"})
 COMPLEXITY_LEVELS = ("low", "medium", "high", "critical")
 
@@ -87,12 +92,103 @@ def _normalize_object_type(ot: Any) -> str:
     return str(ot).strip().lower()
 
 
+def _is_excluded(obj: Any) -> bool:
+    """True if object is marked excluded/commented (e.g. properties.exclude or properties.commented)."""
+    if not obj or not getattr(obj, "properties", None):
+        return False
+    props = obj.properties
+    if not isinstance(props, dict):
+        return False
+    return bool(props.get("exclude") or props.get("commented"))
+
+
 def _is_connection_object_type(ot: str) -> bool:
     """True if normalized object_type is data_source or data_source_connection (DB may store as datasource/datasourceconnection)."""
     if not ot:
         return False
     o = ot.replace("_", "")
     return o in ("datasource", "datasourceconnection")
+
+
+# Pattern: expression is only a single [connection].[table].[column] reference (no actual calculation)
+_SIMPLE_COLUMN_REF = re.compile(r"^\s*\[[^\]]+\]\.\[[^\]]+\]\.\[[^\]]+\]\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _expression_is_simple_column_reference(expression: Any) -> bool:
+    """True if expression is only a single [M].[T].[C] reference (e.g. [bq-connection].[Orders].[Quantity])."""
+    if expression is None:
+        return False
+    if not isinstance(expression, str):
+        return False
+    return bool(_SIMPLE_COLUMN_REF.match(expression.strip()))
+
+
+# Well-known dimension/categorical column names (report spec may omit RS_dataUsage; exclude from measures when no aggregation)
+_DIMENSION_LIKE_NAMES = frozenset({
+    "postal_code", "segment", "category", "sub_category", "region", "country", "state", "city",
+    "customer_name", "customer_id", "product_name", "product_id", "order_id", "order_date",
+    "ship_date", "ship_mode", "state_", "region_",
+})
+
+
+def _name_looks_like_dimension(name: Any) -> bool:
+    """True if column name is typically a dimension (e.g. Postal_Code, Segment, Category)."""
+    if not name or not isinstance(name, str):
+        return False
+    return (name.strip().lower().replace(" ", "_") in _DIMENSION_LIKE_NAMES or
+            name.strip().lower().replace("-", "_") in _DIMENSION_LIKE_NAMES)
+
+
+# Patterns that indicate an expression is a calculated field (exclude from dimensions; they belong in calculated fields).
+# Includes a generic pattern: any identifier( that is not a common aggregate (catches unknown Cognos functions).
+_CALC_EXPRESSION_PATTERNS = (
+    r"extract\s*\(",
+    r"substring_regex",
+    r"_days_to_end_of_month",
+    r"_first_of_month",
+    r"_last_of_month",
+    r"_first_of_quarter",
+    r"_last_of_quarter",
+    r"_first_of_year",
+    r"_last_of_year",
+    r"position_regex",
+    r"substring\s*\(",
+    r"CASE\s+WHEN",
+    r"\bIF\s*\(",
+    r"COALESCE\s*\(",
+    r"\bcast\s*\(",
+    r"\baverage\s*\(",  # average( — treat as calculated field (exclude from measures)
+    r"(?!\b(sum|count|avg|min|max|total|average)\b)\b[a-z_][a-z0-9_]*\s*\(",
+)
+_CALC_EXPRESSION_REGEX = re.compile("|".join(_CALC_EXPRESSION_PATTERNS), re.IGNORECASE)
+
+
+def _expression_looks_like_calculated_field(expression: Any) -> bool:
+    """True if expression indicates a calculated field (extract, substring_regex, _days_to_end_of_month, or any function call that is not a common aggregate)."""
+    if expression is None:
+        return False
+    if not isinstance(expression, str):
+        return False
+    return bool(_CALC_EXPRESSION_REGEX.search(expression.strip()))
+
+
+def _name_looks_like_calculated_field(name: Any) -> bool:
+    """True if name suggests a calculated field (e.g. Cognos convention: leading underscore like _days_to_end_of_month)."""
+    if not name or not isinstance(name, str):
+        return False
+    n = (name or "").strip()
+    return len(n) > 1 and n.startswith("_")
+
+
+def _calc_field_proxy(obj: Any) -> Any:
+    """Return a proxy of obj with object_type='calculated_field' so it is included in calculated fields breakdown.
+    Used for measures/dimensions whose expression looks like a calculated field (e.g. average())."""
+    return SimpleNamespace(
+        id=getattr(obj, "id", getattr(obj, "object_id", None)),
+        name=getattr(obj, "name", "") or "",
+        object_type="calculated_field",
+        properties=getattr(obj, "properties", None) or {},
+    )
 
 
 def _build_complexity_stats(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -207,18 +303,32 @@ class ContainmentTree:
     """
     Reusable tree built from CONTAINS relationships.
     Traverse top-down (parent -> children) or bottom-up (child -> parent to root).
+    canonical_ids: list of unique object ids for iteration (id_to_obj has both id and str(id) for lookup).
     """
-    __slots__ = ("id_to_obj", "contains_parent", "contains_children", "_root_cache")
+    __slots__ = ("id_to_obj", "contains_parent", "contains_children", "canonical_ids", "_root_cache")
 
     def __init__(
         self,
         id_to_obj: dict[Any, ExtractedObject],
         contains_parent: dict[Any, Any],
         contains_children: dict[Any, list[Any]],
+        canonical_ids: Optional[list[Any]] = None,
     ):
         self.id_to_obj = id_to_obj
         self.contains_parent = contains_parent
         self.contains_children = contains_children
+        if canonical_ids is not None:
+            self.canonical_ids = canonical_ids
+        else:
+            # Dedupe: id_to_obj may have both obj.id and str(obj.id) as keys
+            seen: set[Any] = set()
+            self.canonical_ids = []
+            for k in id_to_obj:
+                obj = id_to_obj.get(k)
+                key = getattr(obj, "id", k) if obj is not None else k
+                if key not in seen:
+                    seen.add(key)
+                    self.canonical_ids.append(k)
         self._root_cache: dict[Any, tuple[Any, Optional[str]]] = {}
 
     def get_root(self, object_id: Any) -> tuple[Optional[Any], Optional[str]]:
@@ -228,28 +338,33 @@ class ContainmentTree:
         """
         if object_id in self._root_cache:
             return self._root_cache[object_id]
+        if str(object_id) in self._root_cache:
+            return self._root_cache[str(object_id)]
         visited: set[Any] = set()
         current: Any = object_id
         while current and current not in visited:
             visited.add(current)
-            obj = self.id_to_obj.get(current)
+            obj = self.id_to_obj.get(current) or self.id_to_obj.get(str(current))
             if obj:
                 ot = _normalize_object_type(obj.object_type)
                 if ot in ROOT_OBJECT_TYPES:
                     self._root_cache[object_id] = (current, ot)
+                    self._root_cache[str(object_id)] = (current, ot)
                     return (current, ot)
-            current = self.contains_parent.get(current)
+            current = self.contains_parent.get(current) or self.contains_parent.get(str(current))
         self._root_cache[object_id] = (None, None)
+        self._root_cache[str(object_id)] = (None, None)
         return (None, None)
 
     def roots_top_down(self) -> list[Any]:
         """Root object IDs (dashboard/report) that have no CONTAINS parent in this set."""
         with_parent = set(self.contains_parent.values())
-        return [oid for oid in self.id_to_obj if oid not in with_parent]
+        return [oid for oid in self.canonical_ids if oid not in with_parent]
 
     def children_of(self, object_id: Any) -> list[Any]:
         """Direct children (CONTAINS target) for top-down traversal."""
-        return list(self.contains_children.get(object_id, []))
+        children = self.contains_children.get(object_id, []) or self.contains_children.get(str(object_id), [])
+        return list(children)
 
     def get_descendants(self, root_id: Any) -> set[Any]:
         """All descendant object IDs under root (BFS top-down). Includes root_id."""
@@ -257,7 +372,8 @@ class ContainmentTree:
         queue: list[Any] = [root_id]
         while queue:
             node = queue.pop(0)
-            for child in self.contains_children.get(node, []):
+            children = self.contains_children.get(node, []) or self.contains_children.get(str(node), [])
+            for child in children:
                 if child not in out:
                     out.add(child)
                     queue.append(child)
@@ -269,28 +385,70 @@ def build_containment_tree(
     relationships: list[ObjectRelationship],
 ) -> ContainmentTree:
     """
-    Build complete tree from objects and containment relationships.
-    Uses both CONTAINS and PARENT_CHILD (source = parent, target = child).
+    Build complete tree from objects and containment/traversal relationships.
+    Uses CONTAINS, PARENT_CHILD, FILTERS_BY (source = parent, target = child), plus
+    HAS_COLUMN (table -> measure/dimension) and USES (dashboard/report -> data_module)
+    so that get_root(measure_id) can walk measure -> table -> data_module -> dashboard.
+    FILTERS_BY links report/data_module -> filter so get_root(filter) resolves to report.
     - contains_parent[child_id] = parent_id (for bottom-up traversal)
     - contains_children[parent_id] = [child_ids] (for top-down traversal)
     """
-    id_to_obj = {obj.id: obj for obj in objects}
+    # id_to_obj: both obj.id and str(obj.id) for lookup; canonical_ids: unique list for iteration
+    id_to_obj: dict[Any, ExtractedObject] = {}
+    canonical_ids: list[Any] = []
+    for obj in objects:
+        id_to_obj[obj.id] = obj
+        id_to_obj[str(obj.id)] = obj
+        canonical_ids.append(obj.id)
+    canonical_set = set(canonical_ids)
+    canonical_map: dict[Any, Any] = {}
+    for k in canonical_set:
+        canonical_map[k] = k
+        canonical_map[str(k)] = k
+    all_ids = set(id_to_obj)
     contains_parent: dict[Any, Any] = {}
     contains_children: dict[Any, list[Any]] = defaultdict(list)
     for rel in relationships:
         rt = _normalize_rel_type(rel.relationship_type)
-        if rt not in CONTAINMENT_REL_TYPES:
+        if rt not in CONTAINMENT_OR_TRAVERSAL_REL_TYPES:
             continue
         src, tgt = rel.source_object_id, rel.target_object_id
-        if src not in id_to_obj or tgt not in id_to_obj:
+        if src not in all_ids or tgt not in all_ids:
             continue
-        contains_parent[tgt] = src
-        contains_children[src].append(tgt)
+        c_src = canonical_map.get(src, canonical_map.get(str(src), src))
+        c_tgt = canonical_map.get(tgt, canonical_map.get(str(tgt), tgt))
+        if c_src not in canonical_set or c_tgt not in canonical_set:
+            continue
+        contains_parent[c_tgt] = c_src
+        contains_children[c_src].append(c_tgt)
     return ContainmentTree(
         id_to_obj=id_to_obj,
         contains_parent=contains_parent,
         contains_children=dict(contains_children),
+        canonical_ids=canonical_ids,
     )
+
+
+def _iter_canonical_objects(
+    id_to_obj: dict[Any, Any],
+    canonical_ids: Optional[list[Any]] = None,
+) -> Iterator[tuple[Any, Any]]:
+    """Yield (oid, obj) once per object. Use canonical_ids when provided (e.g. tree.canonical_ids)."""
+    if canonical_ids is not None:
+        for oid in canonical_ids:
+            obj = id_to_obj.get(oid)
+            if obj is not None:
+                yield oid, obj
+        return
+    seen: set[Any] = set()
+    for oid, obj in id_to_obj.items():
+        if obj is None:
+            continue
+        key = getattr(obj, "id", oid)
+        if key in seen:
+            continue
+        seen.add(key)
+        yield oid, obj
 
 
 # =============================================================================
@@ -352,7 +510,17 @@ class ComplexityTracker:
                 self.dash_roots[c_key].add(dash_root_key)
             if report_root_key is not None:
                 self.report_roots[c_key].add(report_root_key)
-    
+
+    def add_item_with_roots(
+        self, complexity: str, dash_roots: set[Any], report_roots: set[Any]
+    ) -> None:
+        """Add one item with given complexity and merge in sets of dashboard/report roots."""
+        c_key = (complexity or "").strip().lower()
+        if c_key in COMPLEXITY_LEVELS:
+            self.count[c_key] += 1
+            self.dash_roots[c_key] |= dash_roots
+            self.report_roots[c_key] |= report_roots
+
     def build_by_complexity(self, count_key: str) -> dict[str, dict[str, Any]]:
         """Build by_complexity dict for the response."""
         return _build_by_complexity(count_key, self.count, self.dash_roots, self.report_roots)
@@ -520,6 +688,9 @@ class ReportService:
         # Include optional usage_stats from assessment (from usage_stats.json upload)
         report["usage_stats"] = getattr(assessment, "usage_stats", None)
 
+        # Full details per dashboard: name, viz_types, calculated_fields, measures, dimensions, filters, queries, columns
+        report["full_details_by_dashboard"] = self._get_full_details_by_dashboard(objects, tree, relationships)
+
         return report
 
     def _build_complex_analysis(self, sections: dict[str, Any]) -> dict[str, Any]:
@@ -542,6 +713,8 @@ class ReportService:
             ("sorts_breakdown", "sort_count", ["dashboards_containing_count", "reports_containing_count"]),
             ("prompts_breakdown", "prompt_count", ["dashboards_containing_count", "reports_containing_count"]),
             ("queries_breakdown", "query_count", ["dashboards_containing_count", "reports_containing_count"]),
+            # add data_modules complexity analysis
+            ("data_modules_breakdown", "data_module_count", ["dashboards_containing_count", "reports_containing_count"]),
         ]
 
         complex_analysis: dict[str, Any] = {}
@@ -599,6 +772,7 @@ class ReportService:
             "sort",
             "prompt",
             "query",
+            "data_module",
         ]
 
         key_findings: list[dict[str, Any]] = []
@@ -672,6 +846,7 @@ class ReportService:
             ("sort", "sorts_breakdown", "total_sorts", "Sort"),
             ("prompt", "prompts_breakdown", "total_prompts", "Prompt"),
             ("query", "queries_breakdown", "total_queries", "Query"),
+            ("data_module", "data_modules_breakdown", "total_data_modules", "Data Module"),
         ]
         overall_key_findings: list[dict[str, Any]] = []
         for _entity_name, section_key, total_key, feature_area_display in overall_key_findings_config:
@@ -830,20 +1005,27 @@ class ReportService:
         return (0, 0, None, None)
 
     def _safe_props(self, props: Any, keys: list[str], preview_len: Optional[int] = None) -> dict[str, Any]:
-        """Extract keys from properties dict; optionally truncate long strings."""
+        """Extract keys from properties dict; optionally truncate long strings.
+        Tries exact key first, then case-insensitive/key-variant match via _get_prop_any_case,
+        so properties stored as camelCase (e.g. cognosClass, sortedColumn) are picked up when
+        snake_case keys (e.g. sorted_column) are requested."""
         if not props or not isinstance(props, dict):
             return {}
         out: dict[str, Any] = {}
         for k in keys:
             v = props.get(k)
             if v is None:
+                v = self._get_prop_any_case(props, k)
+            if v is None:
                 continue
+            # Schema expects snake_case (cognos_class); emit that instead of cognosClass
+            out_key = "cognos_class" if k == "cognosClass" else k
             if preview_len and isinstance(v, str) and len(v) > preview_len:
-                out[k] = v[:preview_len] + "…"
+                out[out_key] = v[:preview_len] + "…"
             elif isinstance(v, (list, dict)):
-                out[k] = v
+                out[out_key] = v
             else:
-                out[k] = v
+                out[out_key] = v
         return out
 
     def _get_prop_any_case(self, props: Any, *key_candidates: str) -> Any:
@@ -882,42 +1064,113 @@ class ReportService:
                 return str(viz)
         return obj.object_type or "unknown"
 
-    def _calculated_field_complexity(self, calculation_type: str, expression: Any) -> str:
+    def _is_datatype_timestamp_with_timezone(self, datatype: Any) -> bool:
         """
-        Derive complexity for a calculated field from calculation_type and expression (props).
+        Return True if the actual datatype (from props) is timestamp with time zone → Critical.
+        Checks the datatype/data_type property value only (not expression text).
+        """
+        if datatype is None:
+            return False
+        s = (datatype if isinstance(datatype, str) else str(datatype)).strip().lower()
+        if not s:
+            return False
+        # Actual type names: timestamp_tz, timestamptz, timestamp with time zone
+        if s in ("timestamp_tz", "timestamptz", "timestamp with time zone", "timestamp with timezone"):
+            return True
+        if "timestamp_tz" in s or "timestamptz" in s:
+            return True
+        if "timestamp with time zone" in s or "timestamp with timezone" in s:
+            return True
+        return False
+
+    def _expression_indicates_timestamp_with_timezone(self, expression: Any) -> bool:
+        """
+        Return True if expression text indicates timestamp with time zone (fallback when datatype is missing).
+        Used for report layer / spec where datatype may not be in props.
+        """
+        if expression is None:
+            return False
+        s = (expression if isinstance(expression, str) else str(expression or "")).strip().lower()
+        if not s:
+            return False
+        if "timestamp with time zone" in s or "timestamp with timezone" in s:
+            return True
+        if "timestamptz" in s or "timestamp_tz" in s:
+            return True
+        if re.search(r"timestamp\s*(\([^)]*\))?\s*with\s+time\s*zone", s):
+            return True
+        return False
+
+    def _name_indicates_timestamp_with_timezone(self, name: Any) -> bool:
+        """
+        Return True if field/column name indicates timestamp with time zone.
+        Used for report layer where datatype and expression may be missing from props.
+        """
+        if name is None:
+            return False
+        s = (name if isinstance(name, str) else str(name or "")).strip().lower()
+        if not s:
+            return False
+        if "timestamp_tz" in s or "timestamptz" in s:
+            return True
+        if "timestamp with time zone" in s or "timestamp with timezone" in s:
+            return True
+        if re.search(r"timestamp\s*(\([^)]*\))?\s*with\s+time\s*zone", s):
+            return True
+        return False
+
+    def _calculated_field_complexity(
+        self,
+        calculation_type: str,
+        expression: Any,
+        datatype: Any = None,
+        name: Any = None,
+    ) -> str:
+        """
+        Derive complexity for a calculated field from calculation_type, expression, optional datatype, and optional name.
+        - Critical if actual datatype is timestamp with time zone (datatype prop), or lookup/tanhyp in expression.
         - embeddedCalculation → Medium
         - case_expression | if_expression | aggregate_function | function → Low
-        - expression: default Low; scan expression text:
-          - critical: prefilter, quartile, power, position_regex, substring_regex, period
-          - medium: cast, lookup, running-minimum, running-maximum, moving-total, moving-average, standard-deviation
-          - else (arithmetic / default) → Low
+        - expression: scan for high/medium terms; else Low.
+        - Report layer: when datatype/expression missing, name (e.g. Order_Date_TZ) is used as fallback for timestamp-with-timezone.
         """
         ct = (calculation_type or "").strip().lower()
         if ct == "embeddedCalculation":
             return "Medium"
         if ct in ("case_expression", "if_expression", "aggregate_function", "function"):
             return "Low"
-        # type "expression" or unknown: check expression content
+        # Timestamp with time zone: from props (datatype), expression text, or name (report layer fallback when props omit datatype/expression)
+        if self._is_datatype_timestamp_with_timezone(datatype):
+            return "Medium"
+        if self._expression_indicates_timestamp_with_timezone(expression):
+            return "Medium"
+        if self._name_indicates_timestamp_with_timezone(name):
+            return "Medium"
         expr_str = (expression if isinstance(expression, str) else str(expression or "")).lower()
-        # Critical first
-        critical_terms = (
-            "prefilter", "quartile", "quantile", "power", 
-            "position_regex", "substring_regex", "period",
-            "lookup", "running-maximum", "running-minimum",
-            "moving-average", "standard-deviation",
-            "regression-average", "tanhyp", "variance",
-            "_ymdint_between", "_ymdint_to_date", "_ymdint_to_time",
-        )
+
+        critical_terms = ("lookup", "tanhyp")
         for term in critical_terms:
             if term in expr_str:
                 return "Critical"
+
+        # High (same level for report and dashboard layer — e.g. current_timestamp)
+        high_terms = (
+            "running-minimum", "running-maximum", "moving-average",
+            "quantile", "quartile", "prefilter", "for report",
+        )
+        for term in high_terms:
+            if term in expr_str:
+                return "High"
+
         # Medium
+        # hour, year, precedes, moving-total, escape, _days_to_end_of_month, _first_of_month, _date_to_int, _add_days, _months_between, _day_of_week, cast, extract, trim, power, position_regex, substring_regex, occurrences_regex, period
         medium_terms = (
-            "cast", "moving-total", 
-            "_add_months", "_add_years", "_add_days", "_add_weeks", 
-            "_add_months", "_add_years", "_add_days", "_add_weeks",
-            "_first_of_month", "_days_between", "_first_of_year",
-            "_months_between", "_years_between",
+            "hour", "year", "precedes", "moving-total", "escape", "_days_to_end_of_month", 
+            "_first_of_month", "_date_to_int", "_add_days", "_months_between", 
+            "_day_of_week", "cast", "extract", "trim", "power", "position_regex", 
+            "substring_regex", "occurrences_regex", "period", "regression-average-x", 
+            "regression-average-y", "regression-average-z", "_days_between",
+            "current_timestamp",
         )
         for term in medium_terms:
             if term in expr_str:
@@ -948,9 +1201,13 @@ class ReportService:
     ) -> tuple[set[Any], set[Any]]:
         """Collect all dashboard and report root IDs."""
         id_to_obj = tree.id_to_obj
+        canonical_ids = getattr(tree, "canonical_ids", None) or list(id_to_obj.keys())
         dashboard_roots: set[Any] = set()
         report_roots: set[Any] = set()
-        for oid, obj in id_to_obj.items():
+        for oid in canonical_ids:
+            obj = id_to_obj.get(oid)
+            if not obj:
+                continue
             ot = _normalize_object_type(obj.object_type)
             if ot == "dashboard":
                 dashboard_roots.add(oid)
@@ -969,22 +1226,26 @@ class ReportService:
         self, 
         relationships: list[ObjectRelationship], 
         id_to_obj: dict[Any, ExtractedObject]
-    ) -> tuple[dict[Any, list[Any]], dict[Any, list[Any]], dict[Any, list[Any]]]:
-        """Build usage_children, usage_parents, and has_column_parents graphs."""
+    ) -> tuple[dict[Any, list[Any]], dict[Any, list[Any]], dict[Any, list[Any]], dict[Any, list[Any]]]:
+        """Build usage_children, usage_parents, has_column_parents, and has_column_children graphs."""
         usage_children: dict[Any, list[Any]] = defaultdict(list)
         usage_parents: dict[Any, list[Any]] = defaultdict(list)
         has_column_parents: dict[Any, list[Any]] = defaultdict(list)
+        has_column_children: dict[Any, list[Any]] = defaultdict(list)
         for rel in relationships:
             rt = _normalize_rel_type(rel.relationship_type)
             src, tgt = rel.source_object_id, rel.target_object_id
-            if src not in id_to_obj or tgt not in id_to_obj:
+            if src not in id_to_obj and str(src) not in id_to_obj:
+                continue
+            if tgt not in id_to_obj and str(tgt) not in id_to_obj:
                 continue
             if rt in USAGE_REL_TYPES:
                 usage_children[src].append(tgt)
                 usage_parents[tgt].append(src)
             elif rt == HAS_COLUMN_REL_TYPE:
                 has_column_parents[tgt].append(src)
-        return usage_children, usage_parents, has_column_parents
+                has_column_children[src].append(tgt)  # table -> measure/dimension for BFS from dashboard
+        return usage_children, usage_parents, has_column_parents, has_column_children
 
     def _bfs_reach_objects_of_type(
         self,
@@ -1060,9 +1321,10 @@ class ReportService:
     # -------------------------------------------------------------------------
 
     def _build_parent_map(
-        self, 
-        relationships: list[ObjectRelationship], 
-        id_to_obj: dict[Any, ExtractedObject]
+        self,
+        relationships: list[ObjectRelationship],
+        id_to_obj: dict[Any, ExtractedObject],
+        canonical_ids: Optional[list[Any]] = None,
     ) -> dict[Any, Any]:
         """Build parent_map from relationships and object properties."""
         parent_map: dict[Any, Any] = {}
@@ -1073,7 +1335,7 @@ class ReportService:
                 tgt = rel.target_object_id
                 if src in id_to_obj and tgt in id_to_obj:
                     parent_map[tgt] = src
-        for oid, obj in id_to_obj.items():
+        for oid, obj in _iter_canonical_objects(id_to_obj, canonical_ids):
             pid = (obj.properties or {}).get("parent_id") if isinstance(obj.properties, dict) else None
             if pid is not None:
                 for cand_id in (pid, str(pid)):
@@ -1116,9 +1378,14 @@ class ReportService:
         preview_len: Optional[int] = None,
         item_builder: Optional[Callable[[ExtractedObject, dict[str, Any], int, int], dict[str, Any]]] = None,
         default_complexity: Optional[str] = None,
+        node_id_to_dashboard_roots: Optional[dict[Any, set[Any]]] = None,
+        node_id_to_report_roots: Optional[dict[Any, set[Any]]] = None,
     ) -> dict[str, Any]:
         """
         Generic breakdown method that handles the common pattern for many object types.
+        When node_id_to_dashboard_roots and node_id_to_report_roots are provided, they are used
+        for dashboard/report counts instead of _resolve_containment_root (e.g. for sorts enriched
+        from visualization data_items).
         """
         file_container = self._file_to_container_type(objects)
         relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
@@ -1138,9 +1405,17 @@ class ReportService:
             props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
             extra = self._safe_props(props, prop_keys, preview_len=preview_len)
             
-            dashboards_count, reports_count, dash_root_key, report_root_key = self._resolve_containment_root(
-                obj, tree, file_container, relationships_by_target
-            )
+            if node_id_to_dashboard_roots is not None and node_id_to_report_roots is not None:
+                dash_set = node_id_to_dashboard_roots.get(obj.id) or node_id_to_dashboard_roots.get(str(obj.id)) or set()
+                rep_set = node_id_to_report_roots.get(obj.id) or node_id_to_report_roots.get(str(obj.id)) or set()
+                dashboards_count = len(dash_set)
+                reports_count = len(rep_set)
+                dash_root_key = next(iter(dash_set), None) if dash_set else None
+                report_root_key = next(iter(rep_set), None) if rep_set else None
+            else:
+                dashboards_count, reports_count, dash_root_key, report_root_key = self._resolve_containment_root(
+                    obj, tree, file_container, relationships_by_target
+                )
             
             if complexity_fn:
                 complexity = complexity_fn(obj, props)
@@ -1156,6 +1431,8 @@ class ReportService:
                 "complexity": complexity,
                 "dashboards_containing_count": dashboards_count,
                 "reports_containing_count": reports_count,
+                "dash_root_key": dash_root_key,
+                "report_root_key": report_root_key,
             }
             
             if item_builder:
@@ -1325,6 +1602,13 @@ class ReportService:
         for obj in objects:
             if not self._is_visualization_object(obj):
                 continue
+            if _is_excluded(obj):
+                continue
+            root_id, root_kind = tree.get_root(obj.id)
+            if root_id is not None:
+                root_obj = id_to_obj.get(root_id)
+                if root_obj and _is_excluded(root_obj):
+                    continue
             viz_type = self._get_visualization_type_for_object(obj)
             key = (viz_type or "").strip().lower()
             info = viz_complexity_lookup.get(key) or {}
@@ -1332,7 +1616,6 @@ class ReportService:
             description = info.get("description")
             recommended = info.get("recommended")
 
-            root_id, root_kind = tree.get_root(obj.id)
             dashboard_or_report_name: Optional[str] = None
             if root_kind == "dashboard" and root_id is not None:
                 root_obj = id_to_obj.get(root_id)
@@ -1391,7 +1674,7 @@ class ReportService:
 
         # Also include dashboard roots that have no other objects (standalone)
         id_to_obj = tree.id_to_obj
-        for oid, obj in id_to_obj.items():
+        for oid, obj in _iter_canonical_objects(id_to_obj, getattr(tree, "canonical_ids", None)):
             ot = _normalize_object_type(obj.object_type)
             if ot == "dashboard":
                 dashboard_to_ids[oid].add(oid)
@@ -1427,13 +1710,21 @@ class ReportService:
                 elif ot == "dimension":
                     counts["dimensions"] += 1
                 elif ot == "calculated_field":
-                    counts["calculated_fields"] += 1
+                    expr = (obj.properties or {}).get("expression") if isinstance(obj.properties, dict) else None
+                    if not _expression_is_simple_column_reference(expr):
+                        counts["calculated_fields"] += 1
                 elif ot == "data_module":
                     counts["data_modules"] += 1
                 elif ot == "package":
                     counts["packages"] += 1
                 elif ot in ("data_source", "data_source_connection"):
                     counts["data_sources"] += 1
+                elif ot == "parameter":
+                    counts["parameters"] += 1
+                elif ot == "sort":
+                    counts["sorts"] += 1
+                elif ot == "prompt":
+                    counts["prompts"] += 1
             
             viz_by_complexity = {level: counts[f"visualizations_{level}"] for level in COMPLEXITY_LEVELS}
             dashboard_complexity = self._derive_complexity_from_viz(viz_by_complexity)
@@ -1454,6 +1745,9 @@ class ReportService:
                 "total_data_modules": counts["data_modules"],
                 "total_packages": counts["packages"],
                 "total_data_sources": counts["data_sources"],
+                "total_sorts": counts["sorts"],
+                "total_prompts": counts["prompts"],
+                "total_parameters": counts["parameters"],
             })
         
         total_dashboards = len(dashboard_to_ids)
@@ -1467,7 +1761,319 @@ class ReportService:
             "dashboards_containing_any_count": total_dashboards,
             "reports_containing_any_count": 0,
         }
-    
+
+    def _get_full_details_by_dashboard(
+        self,
+        objects: list[ExtractedObject],
+        tree: ContainmentTree,
+        relationships: list[ObjectRelationship],
+    ) -> list[dict[str, Any]]:
+        """
+        Full details per dashboard: name, viz_types, calculated_fields, measures,
+        dimensions, filters, queries, columns. Each entity list includes id, name,
+        and type-specific props (expression, aggregation, filter_type, etc.).
+        Dashboard membership uses containment (CONTAINS/PARENT_CHILD) first, then
+        BFS via all relationships (e.g. FILTERS_BY so filters under report/module
+        can resolve to dashboard when there is a path).
+        """
+        id_to_obj = tree.id_to_obj
+        file_container = self._file_to_container_type(objects)
+        relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
+        for rel in relationships:
+            tgt = rel.target_object_id
+            relationships_by_target[tgt].append(rel.source_object_id)
+            if str(tgt) != tgt:
+                relationships_by_target[str(tgt)] = relationships_by_target[tgt]
+
+        def _resolve_to_dashboard_root(oid: Any) -> Optional[Any]:
+            """Return dashboard root id if this object belongs to a dashboard, else None. Uses get_root, then BFS, then data-module storeID→dashboard USES."""
+            root_id, root_kind = tree.get_root(oid)
+            if root_kind == "dashboard" and root_id is not None:
+                return root_id
+            if root_kind == "report" and root_id is not None:
+                return None
+            seen: set[Any] = {oid, str(oid)} if oid is not None else set()
+            queue: list[Any] = []
+            for key in (oid, str(oid)):
+                for src_id in relationships_by_target.get(key, []):
+                    if src_id not in seen:
+                        seen.add(src_id)
+                        queue.append(src_id)
+            while queue:
+                node = queue.pop(0)
+                rid, rkind = tree.get_root(node)
+                if rkind == "dashboard" and rid is not None:
+                    return rid
+                if rkind == "report" and rid is not None:
+                    return None
+                for key in (node, str(node)):
+                    for src_id in relationships_by_target.get(key, []):
+                        if src_id not in seen:
+                            seen.add(src_id)
+                            queue.append(src_id)
+            # Fallback: measures/dimensions live under data_module; dashboard USES data_module by storeID (not object_id).
+            # Walk up containment to find a data_module and resolve via dashboard USES storeID.
+            current: Any = oid
+            while current is not None:
+                obj = id_to_obj.get(current)
+                if obj and _normalize_object_type(obj.object_type) == "data_module":
+                    # Persisted USES is dashboard -> data_module (UUID); also check storeID for legacy/parser-only
+                    for key in (current, str(current)):
+                        for src_id in relationships_by_target.get(key, []):
+                            for dkey in (src_id, str(src_id)):
+                                if dkey in id_to_obj and _normalize_object_type(id_to_obj[dkey].object_type) == "dashboard":
+                                    return dkey
+                    props = obj.properties if isinstance(obj.properties, dict) else {}
+                    store_id = props.get("storeID") or props.get("store_id")
+                    if store_id:
+                        for key in (store_id, str(store_id)):
+                            for src_id in relationships_by_target.get(key, []):
+                                for dkey in (src_id, str(src_id)):
+                                    if dkey in id_to_obj and _normalize_object_type(id_to_obj[dkey].object_type) == "dashboard":
+                                        return dkey
+                    break
+                current = tree.contains_parent.get(current)
+            if id_to_obj.get(oid) and getattr(id_to_obj.get(oid), "file_id", None) is not None:
+                fid = id_to_obj[oid].file_id
+                if file_container.get(fid) == "dashboard":
+                    for did, obj in _iter_canonical_objects(id_to_obj, getattr(tree, "canonical_ids", None)):
+                        if _normalize_object_type(obj.object_type) == "dashboard" and getattr(obj, "file_id", None) == fid:
+                            return did
+            return None
+
+        # Group object IDs by dashboard root: containment first, then BFS fallback (so FILTERS_BY etc. resolve)
+        dashboard_to_ids: dict[Any, set[Any]] = defaultdict(set)
+        for obj in objects:
+            dash_id = _resolve_to_dashboard_root(obj.id)
+            if dash_id is not None:
+                dashboard_to_ids[dash_id].add(obj.id)
+        for oid, obj in id_to_obj.items():
+            ot = _normalize_object_type(obj.object_type)
+            if ot == "dashboard":
+                dashboard_to_ids[oid].add(oid)
+
+        parent_map = self._build_parent_map(relationships, id_to_obj, getattr(tree, "canonical_ids", None))
+
+        def _name(obj: Optional[ExtractedObject], oid: Any) -> str:
+            if obj and getattr(obj, "name", None):
+                s = (obj.name or "").strip()
+                if s:
+                    return s
+            return str(oid)
+
+        def _calc_field_item(obj: ExtractedObject, oid: Any) -> dict[str, Any]:
+            props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+            calc_type = (self._get_prop_any_case(props, "calculation_type") or "").strip() or "expression"
+            expr_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
+            datatype = self._get_prop_any_case(props, "datatype", "data_type")
+            complexity = self._calculated_field_complexity(calc_type, expr_raw, datatype, _name(obj, oid))
+            extra = self._safe_props(props, ["expression", "calculation_type", "cognosClass"], preview_len=500)
+            return {
+                "id": str(oid),
+                "name": _name(obj, oid),
+                "expression": extra.get("expression"),
+                "calculation_type": calc_type or extra.get("calculation_type"),
+                "complexity": complexity,
+                **{k: v for k, v in extra.items() if k not in ("expression", "calculation_type")},
+            }
+
+        def _measure_item(obj: ExtractedObject, oid: Any) -> dict[str, Any]:
+            props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+            agg = props.get("regularAggregate") or props.get("aggregation") or ""
+            is_simple = (agg or "").lower() in ("", "none", "none ")
+            is_complex = not is_simple
+            module_id, module_name = self._get_parent_module_id(oid, parent_map, id_to_obj)
+            extra = self._safe_props(props, ["cognosClass", "regularAggregate", "datatype", "usage", "expression"], preview_len=300)
+            expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
+            datatype = self._get_prop_any_case(props, "datatype", "data_type")
+            complexity = self._calculated_field_complexity("expression", expression_raw, datatype, _name(obj, oid))
+            return {
+                "id": str(oid),
+                "name": _name(obj, oid),
+                "aggregation": agg or None,
+                "is_simple": is_simple,
+                "is_complex": is_complex,
+                "parent_module_id": str(module_id) if module_id is not None else None,
+                "parent_module_name": module_name,
+                "expression": extra.get("expression"),
+                "complexity": complexity,
+                **{k: v for k, v in extra.items() if k != "expression"},
+            }
+
+        def _dimension_item(obj: ExtractedObject, oid: Any) -> dict[str, Any]:
+            props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+            usage = props.get("usage") or props.get("data_usage") or ""
+            is_simple = (usage or "").lower() in ("attribute", "dimension", "")
+            is_complex = not is_simple
+            module_id, module_name = self._get_parent_module_id(oid, parent_map, id_to_obj)
+            extra = self._safe_props(props, ["cognosClass", "usage", "datatype", "expression"], preview_len=300)
+            expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
+            datatype = self._get_prop_any_case(props, "datatype", "data_type")
+            complexity = self._calculated_field_complexity("expression", expression_raw, datatype, _name(obj, oid))
+            return {
+                "id": str(oid),
+                "name": _name(obj, oid),
+                "usage": usage or None,
+                "is_simple": is_simple,
+                "is_complex": is_complex,
+                "parent_module_id": str(module_id) if module_id is not None else None,
+                "parent_module_name": module_name,
+                "expression": extra.get("expression"),
+                "complexity": complexity,
+                **{k: v for k, v in extra.items() if k != "expression"},
+            }
+
+        def _filter_item(obj: ExtractedObject, oid: Any) -> dict[str, Any]:
+            props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+            is_complex = props.get("is_complex") is True
+            complexity = "Medium" if is_complex else "Low"
+            parent_id = props.get("parent_id") or getattr(obj, "parent_id", None)
+            parent_name: Optional[str] = None
+            associated_container_type: Optional[str] = None
+            if parent_id and id_to_obj:
+                for pid in (parent_id, str(parent_id)):
+                    parent_obj = id_to_obj.get(pid)
+                    if parent_obj:
+                        parent_name = (parent_obj.name or "").strip() or str(pid)
+                        associated_container_type = _normalize_object_type(parent_obj.object_type)
+                        break
+            extra = self._safe_props(
+                props,
+                [
+                    "expression", "filter_type", "filter_scope", "filter_style",
+                    "is_simple", "is_complex", "ref_data_item", "filter_definition_summary",
+                    "postAutoAggregation", "referenced_columns", "parameter_references", "cognosClass",
+                    "scope", "hierarchyNames", "hierarchyUniqueNames", "conditions", "tupleSet", "sourceId",
+                ],
+                preview_len=500,
+            )
+            return {
+                "id": str(oid),
+                "name": _name(obj, oid),
+                "complexity": complexity,
+                "parent_id": str(parent_id) if parent_id is not None else None,
+                "parent_name": parent_name,
+                "associated_container_type": associated_container_type,
+                **extra,
+            }
+
+        result: list[dict[str, Any]] = []
+        for dash_id, member_ids in dashboard_to_ids.items():
+            dash_obj = id_to_obj.get(dash_id)
+            dashboard_name = _name(dash_obj, dash_id)
+
+            viz_types_set: set[str] = set()
+            tabs: list[dict[str, Any]] = []
+            visualizations: list[dict[str, Any]] = []
+            calculated_fields: list[dict[str, Any]] = []
+            measures: list[dict[str, Any]] = []
+            dimensions: list[dict[str, Any]] = []
+            filters: list[dict[str, Any]] = []
+            queries: list[dict[str, Any]] = []
+            columns: list[dict[str, Any]] = []
+            packages: list[dict[str, Any]] = []
+            data_modules: list[dict[str, Any]] = []
+            data_sources: list[dict[str, Any]] = []
+
+            for oid in member_ids:
+                obj = id_to_obj.get(oid)
+                if not obj:
+                    continue
+                ot = _normalize_object_type(obj.object_type)
+                if self._is_visualization_object(obj):
+                    viz_type = self._get_visualization_type_for_object(obj)
+                    if viz_type and (viz_type or "").strip():
+                        viz_types_set.add((viz_type or "").strip())
+                    props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+                    data_items = props.get("data_items") or []
+                    if isinstance(data_items, list) and len(data_items) > 50:
+                        data_items = data_items[:50] + [{"_truncated": len(data_items) - 50}]
+                    visualizations.append({
+                        "id": str(oid),
+                        "name": _name(obj, oid),
+                        "viz_type": (viz_type or "").strip() or "unknown",
+                        "data_items": data_items,
+                    })
+                elif ot == "tab":
+                    tabs.append({"id": str(oid), "name": _name(obj, oid)})
+                elif ot == "calculated_field":
+                    expr = (obj.properties or {}).get("expression") if isinstance(obj.properties, dict) else None
+                    if not _expression_is_simple_column_reference(expr):
+                        calculated_fields.append(_calc_field_item(obj, oid))
+                elif ot == "measure":
+                    measures.append(_measure_item(obj, oid))
+                elif ot == "dimension":
+                    dimensions.append(_dimension_item(obj, oid))
+                elif ot == "filter":
+                    filters.append(_filter_item(obj, oid))
+                elif ot == "query":
+                    queries.append({"id": str(oid), "name": _name(obj, oid)})
+                elif ot == "column":
+                    columns.append({"id": str(oid), "name": _name(obj, oid)})
+                elif ot == "package":
+                    packages.append({"id": str(oid), "name": _name(obj, oid)})
+                elif ot == "data_module":
+                    props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+                    store_id = props.get("storeID") or props.get("store_id")
+                    dash_props = (dash_obj.properties or {}) if dash_obj and isinstance(getattr(dash_obj, "properties", None), dict) else {}
+                    display_names = dash_props.get("data_module_display_names") or {}
+                    display_name = (display_names.get(store_id) or display_names.get(str(store_id) if store_id else "") or "").strip() or _name(obj, oid)
+                    data_modules.append({"id": str(oid), "name": _name(obj, oid), "display_name": display_name or _name(obj, oid)})
+                elif ot in ("data_source", "data_source_connection"):
+                    data_sources.append({"id": str(oid), "name": _name(obj, oid)})
+
+            # Add measures/dimensions that appear in visualization data_items but were not in member_ids
+            # (Dashboard -> Visualization -> data_items references measures/dimensions by itemLabel/itemId)
+            added_measure_ids = {m["id"] for m in measures}
+            added_dimension_ids = {d["id"] for d in dimensions}
+            data_item_refs: set[str] = set()
+            for v in visualizations:
+                for di in (v.get("data_items") or []):
+                    if isinstance(di, dict) and "_truncated" not in di:
+                        for key in ("itemLabel", "itemId", "dataItemId"):
+                            val = di.get(key)
+                            if val and isinstance(val, str):
+                                data_item_refs.add((val or "").strip().lower())
+            for obj in objects:
+                ot = _normalize_object_type(obj.object_type)
+                if ot not in ("measure", "dimension"):
+                    continue
+                name_norm = ((obj.name or "").strip() or "").lower()
+                if not name_norm:
+                    continue
+                if ot == "measure" and str(obj.id) not in added_measure_ids:
+                    if name_norm in data_item_refs or any(
+                        name_norm in r or (r.endswith("." + name_norm) if "." in r else False)
+                        for r in data_item_refs
+                    ):
+                        measures.append(_measure_item(obj, obj.id))
+                        added_measure_ids.add(str(obj.id))
+                elif ot == "dimension" and str(obj.id) not in added_dimension_ids:
+                    if name_norm in data_item_refs or any(
+                        name_norm in r or (r.endswith("." + name_norm) if "." in r else False)
+                        for r in data_item_refs
+                    ):
+                        dimensions.append(_dimension_item(obj, obj.id))
+                        added_dimension_ids.add(str(obj.id))
+
+            result.append({
+                "dashboard_id": str(dash_id),
+                "dashboard_name": dashboard_name,
+                "viz_types": sorted(viz_types_set),
+                "tabs": tabs,
+                "visualizations": visualizations,
+                "calculated_fields": calculated_fields,
+                "measures": measures,
+                "dimensions": dimensions,
+                "filters": filters,
+                "queries": queries,
+                "columns": columns,
+                "packages": packages,
+                "data_modules": data_modules,
+                "data_sources": data_sources,
+            })
+        return result
+
     # -------------------------------------------------------------------------
     # Reports Breakdown
     # -------------------------------------------------------------------------
@@ -1508,7 +2114,7 @@ class ReportService:
             root_id, root_kind = tree.get_root(obj.id)
             if root_kind == "dashboard" and root_id is not None:
                 dashboard_to_ids[root_id].add(obj.id)
-        for oid, obj in id_to_obj.items():
+        for oid, obj in _iter_canonical_objects(id_to_obj, getattr(tree, "canonical_ids", None)):
             ot = _normalize_object_type(obj.object_type)
             if ot == "dashboard":
                 dashboard_to_ids[oid].add(oid)
@@ -1582,6 +2188,8 @@ class ReportService:
         dashboards_list: list[dict[str, Any]] = []
         for dash_id in dashboard_to_ids:
             dash_obj = id_to_obj.get(dash_id)
+            if dash_obj and _is_excluded(dash_obj):
+                continue
             name = (dash_obj.name if dash_obj else None) or str(dash_id)
             owner = self._get_owner(dash_obj)
             package_names = sorted(
@@ -1611,7 +2219,7 @@ class ReportService:
             root_id, root_kind = tree.get_root(obj.id)
             if root_kind == "report" and root_id is not None:
                 report_to_ids[root_id].add(obj.id)
-        for oid, obj in id_to_obj.items():
+        for oid, obj in _iter_canonical_objects(id_to_obj, getattr(tree, "canonical_ids", None)):
             ot = _normalize_object_type(obj.object_type)
             if ot == "report":
                 report_to_ids[oid].add(oid)
@@ -1685,6 +2293,8 @@ class ReportService:
         reports_list: list[dict[str, Any]] = []
         for report_id in report_to_ids:
             report_obj = id_to_obj.get(report_id)
+            if report_obj and _is_excluded(report_obj):
+                continue
             name = (report_obj.name if report_obj else None) or str(report_id)
             owner = self._get_owner(report_obj)
             package_names = sorted(
@@ -1738,7 +2348,7 @@ class ReportService:
             if root_kind == "report" and root_id is not None:
                 report_to_ids[root_id].add(obj.id)
 
-        for oid, obj in id_to_obj.items():
+        for oid, obj in _iter_canonical_objects(id_to_obj, getattr(tree, "canonical_ids", None)):
             ot = _normalize_object_type(obj.object_type)
             if ot == "report":
                 report_to_ids[oid].add(oid)
@@ -1866,14 +2476,19 @@ class ReportService:
                 elif ot == "prompt":
                     counts["prompts"] += 1
                 elif ot == "calculated_field":
-                    counts["calculated_fields"] += 1
                     props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
-                    calc_type = (self._get_prop_any_case(props, "calculation_type") or "").strip() or "expression"
                     expr_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
-                    cf_complexity = self._calculated_field_complexity(calc_type, expr_raw)
-                    cf_c = (cf_complexity or "").strip().lower()
-                    if cf_c in COMPLEXITY_LEVELS:
-                        counts[f"calculated_fields_{cf_c}"] += 1
+                    if _expression_is_simple_column_reference(expr_raw):
+                        pass  # exclude [M].[T].[C]-only from report counts
+                    else:
+                        counts["calculated_fields"] += 1
+                        calc_type = (self._get_prop_any_case(props, "calculation_type") or "").strip() or "expression"
+                        cf_datatype = self._get_prop_any_case(props, "datatype", "data_type")
+                        cf_name = (getattr(obj, "name", None) or "").strip() or None
+                        cf_complexity = self._calculated_field_complexity(calc_type, expr_raw, cf_datatype, cf_name)
+                        cf_c = (cf_complexity or "").strip().lower()
+                        if cf_c in COMPLEXITY_LEVELS:
+                            counts[f"calculated_fields_{cf_c}"] += 1
                 elif ot == "measure":
                     counts["measures"] += 1
                 elif ot == "dimension":
@@ -2038,7 +2653,7 @@ class ReportService:
                 if key not in package_key_to_canonical_and_members:
                     package_key_to_canonical_and_members[key] = (pkg_id, set())
                 package_key_to_canonical_and_members[key][1].add(obj.id)
-        for oid, obj in id_to_obj.items():
+        for oid, obj in _iter_canonical_objects(id_to_obj, getattr(tree, "canonical_ids", None)):
             ot = _normalize_object_type(obj.object_type)
             if ot == "package":
                 key = str(oid)
@@ -2150,7 +2765,7 @@ class ReportService:
                 connection_objects.append((obj.id, obj))
 
         # Build usage graphs
-        usage_children, usage_parents, has_column_parents = self._build_usage_graphs(relationships, id_to_obj)
+        usage_children, usage_parents, has_column_parents, has_column_children = self._build_usage_graphs(relationships, id_to_obj)
 
         # Collect roots
         dashboard_roots, report_roots = self._collect_dashboard_report_roots(objects, tree)
@@ -2263,14 +2878,34 @@ class ReportService:
         relationships: Optional[list[ObjectRelationship]] = None,
     ) -> dict[str, Any]:
         """Total calculated fields and per-field details (expression, type, etc.)."""
+        # Build list: (1) calculated_field whose expression is not only [M].[T].[C], (2) measures/dimensions
+        # whose expression looks like a calculated field (e.g. average()) — include as proxies so they appear here
+        # instead of in measures/dimensions breakdown.
+        def _expr(o: Any) -> str:
+            p = getattr(o, "properties", None) or {}
+            if not isinstance(p, dict):
+                return ""
+            return (self._get_prop_any_case(p, "expression", "formula", "calculation") or "") or ""
+        objects_for_calc: list[Any] = []
+        for o in objects:
+            ot = _normalize_object_type(getattr(o, "object_type", None))
+            expr = _expr(o)
+            if ot == "calculated_field":
+                if not _expression_is_simple_column_reference(expr):
+                    objects_for_calc.append(o)
+            elif ot in ("measure", "dimension"):
+                if _expression_looks_like_calculated_field(expr) and not _expression_is_simple_column_reference(expr):
+                    objects_for_calc.append(_calc_field_proxy(o))
         def complexity_fn(obj: ExtractedObject, props: dict[str, Any]) -> str:
             calc_type = (self._get_prop_any_case(props, "calculation_type") or "").strip() or "expression"
             expr_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
-            return self._calculated_field_complexity(calc_type, expr_raw)
+            datatype = self._get_prop_any_case(props, "datatype", "data_type")
+            name = (getattr(obj, "name", None) or props.get("name") or "").strip() or None
+            return self._calculated_field_complexity(calc_type, expr_raw, datatype, name)
         
         # Parser (data_module_extractor) emits: expression, calculation_type, cognosClass.
         result = self._get_generic_breakdown(
-            objects=objects,
+            objects=objects_for_calc,
             tree=tree,
             relationships=relationships or [],
             object_type="calculated_field",
@@ -2280,32 +2915,49 @@ class ReportService:
             prop_keys=["expression", "calculation_type", "cognosClass"],
             preview_len=500,
         )
-        # Items with same name, expression, and calculation_type should be grouped together
+        # Items with same name, expression, and calculation_type should be grouped together.
+        # Rebuild by_complexity from grouped items so complexity analysis counts match inventory.
         items = result["calculated_fields"]
         group_key_to_items: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
         for it in items:
             key = (it["name"], it.get("expression", ""), it.get("calculation_type", ""))
             group_key_to_items[key].append(it)
         grouped: list[dict[str, Any]] = []
+        grouped_tracker = ComplexityTracker()
         for group in group_key_to_items.values():
             first = group[0]
+            dash_roots = set()
+            report_roots = set()
+            for x in group:
+                dk = x.get("dash_root_key")
+                if dk is not None:
+                    dash_roots.add(dk)
+                rk = x.get("report_root_key")
+                if rk is not None:
+                    report_roots.add(rk)
+            merged_complexity = max((x.get("complexity") or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first.get("complexity")
+            grouped_tracker.add_item_with_roots(merged_complexity, dash_roots, report_roots)
             merged = {
                 "calculated_field_id": first["calculated_field_id"],
                 "calculated_field_ids": [x["calculated_field_id"] for x in group],
                 "name": first["name"],
                 "expression": first.get("expression"),
                 "calculation_type": first.get("calculation_type"),
-                "complexity": max((x.get("complexity") or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first.get("complexity"),
+                "complexity": merged_complexity,
                 "dashboards_containing_count": max(x["dashboards_containing_count"] for x in group),
                 "reports_containing_count": max(x["reports_containing_count"] for x in group),
             }
             for k, v in first.items():
-                if k not in ("calculated_field_id", "name", "expression", "calculation_type", "complexity", "dashboards_containing_count", "reports_containing_count"):
+                if k not in ("calculated_field_id", "name", "expression", "calculation_type", "complexity", "dashboards_containing_count", "reports_containing_count", "dash_root_key", "report_root_key"):
                     merged[k] = v
             grouped.append(merged)
         result["calculated_fields"] = grouped
         result["total_calculated_fields"] = len(grouped)
         result["stats"] = _build_complexity_stats(grouped)
+        result["by_complexity"] = grouped_tracker.build_by_complexity("calculated_field_count")
+        result["dashboards_containing_any_count"], result["reports_containing_any_count"] = _union_root_counts(
+            grouped_tracker.dash_roots, grouped_tracker.report_roots
+        )
         return result
 
     # -------------------------------------------------------------------------
@@ -2397,7 +3049,31 @@ class ReportService:
         tree: ContainmentTree,
         relationships: list[ObjectRelationship],
     ) -> dict[str, Any]:
-        """Total sorts and per-sort details."""
+        """Total sorts and per-sort details. Uses containment roots plus enrichment from visualization data_items."""
+        file_container = self._file_to_container_type(objects)
+        relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
+        for rel in relationships:
+            tgt = rel.target_object_id
+            relationships_by_target[tgt].append(rel.source_object_id)
+            if str(tgt) != tgt:
+                relationships_by_target[str(tgt)] = relationships_by_target[tgt]
+        node_id_to_dashboard_roots: dict[Any, set[Any]] = defaultdict(set)
+        node_id_to_report_roots: dict[Any, set[Any]] = defaultdict(set)
+        for obj in objects:
+            if _normalize_object_type(obj.object_type) != "sort":
+                continue
+            _dash, _rep, dash_key, report_key = self._resolve_containment_root(
+                obj, tree, file_container, relationships_by_target
+            )
+            if dash_key is not None:
+                node_id_to_dashboard_roots[obj.id].add(dash_key)
+                node_id_to_dashboard_roots[str(obj.id)].add(dash_key)
+            if report_key is not None:
+                node_id_to_report_roots[obj.id].add(report_key)
+                node_id_to_report_roots[str(obj.id)].add(report_key)
+        self._enrich_roots_from_visualization_data_items(
+            objects, tree, node_id_to_dashboard_roots, node_id_to_report_roots
+        )
         result = self._get_generic_breakdown(
             objects=objects,
             tree=tree,
@@ -2408,8 +3084,9 @@ class ReportService:
             complexity_fn=None,
             default_complexity="Low",
             prop_keys=["direction", "sorted_column", "sort_items", "cognosClass"],
+            node_id_to_dashboard_roots=node_id_to_dashboard_roots,
+            node_id_to_report_roots=node_id_to_report_roots,
         )
-        
         result["total_sorts"] = result.pop("total_sorts")
         result["sorts"] = result.pop("sorts")
         return result
@@ -2480,7 +3157,7 @@ class ReportService:
                 continue
             module_objects.append((obj.id, obj))
 
-        usage_children, usage_parents, has_column_parents = self._build_usage_graphs(relationships, id_to_obj)
+        usage_children, usage_parents, has_column_parents, has_column_children = self._build_usage_graphs(relationships, id_to_obj)
         dashboard_roots, report_roots = self._collect_dashboard_report_roots(objects, tree)
 
         module_id_to_dashboard_roots: dict[Any, set[Any]] = defaultdict(set)
@@ -2531,17 +3208,25 @@ class ReportService:
         total_main_data_modules = sum(1 for _oid, obj in module_objects if self._is_main_data_module(obj))
         total_unique_modules = len(key_to_canonical)
 
+        tracker = ComplexityTracker()
         modules_list: list[dict[str, Any]] = []
         main_modules_list: list[dict[str, Any]] = []
         for key, (module_id, obj) in key_to_canonical.items():
             module_ids_in_key = key_to_module_ids.get(key, {module_id})
-            dash_count, report_count = dashboards_and_reports_using(module_ids_in_key)
+            dash_roots_used: set[Any] = set()
+            report_roots_used: set[Any] = set()
+            for mid in module_ids_in_key:
+                dash_roots_used |= module_id_to_dashboard_roots.get(mid, set())
+                report_roots_used |= module_id_to_report_roots.get(mid, set())
+            complexity = "Medium"
+            tracker.add_item_with_roots(complexity, dash_roots_used, report_roots_used)
+            dash_count, report_count = len(dash_roots_used), len(report_roots_used)
             extra = self._get_data_module_properties(obj)
             name = (obj.name or "").strip() or f"<unnamed data module>"
             item: dict[str, Any] = {
                 "data_module_id": str(module_id),
                 "name": name,
-                "complexity": "Medium",
+                "complexity": complexity,
                 "dashboards_using_count": dash_count,
                 "reports_using_count": report_count,
                 **extra,
@@ -2550,14 +3235,21 @@ class ReportService:
             if self._is_main_data_module(obj):
                 main_modules_list.append(item)
 
-        _stats = {"low": 0, "medium": len(modules_list), "high": 0, "critical": 0}
+        by_complexity = tracker.build_by_complexity("data_module_count")
+        _stats = {level: tracker.count.get(level, 0) for level in COMPLEXITY_LEVELS}
         overall_complexity = _overall_complexity_linear(_stats)
+        dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
+            tracker.dash_roots, tracker.report_roots
+        )
         return {
             "total_data_modules": total_data_modules,
             "total_main_data_modules": total_main_data_modules,
             "total_unique_modules": total_unique_modules,
             "overall_complexity": overall_complexity,
             "stats": _stats,
+            "by_complexity": by_complexity,
+            "dashboards_containing_any_count": dashboards_containing_any_count,
+            "reports_containing_any_count": reports_containing_any_count,
             "data_modules": modules_list,
             "main_data_modules": main_modules_list,
         }
@@ -2614,6 +3306,7 @@ class ReportService:
                 "query_id": str(obj.id),
                 "name": (obj.name or "").strip() or "<unnamed query>",
                 "source_type": source_type,
+                "is_prompt_query": props.get("is_prompt_query") is True,
                 "is_simple": is_simple,
                 "is_complex": is_complex,
                 "report_id": report_id,
@@ -2644,6 +3337,164 @@ class ReportService:
     # Measures Breakdown
     # -------------------------------------------------------------------------
 
+    def _build_node_id_to_roots_for_leaf_objects(
+        self,
+        objects: list[ExtractedObject],
+        tree: ContainmentTree,
+        relationships: list[ObjectRelationship],
+    ) -> tuple[dict[Any, set[Any]], dict[Any, set[Any]]]:
+        """
+        BFS from dashboard/report roots following contains_children + usage_children + has_column_children
+        so we reach measures/dimensions (dashboard -> data_module -> table -> measure).
+        Returns (node_id_to_dashboard_roots, node_id_to_report_roots).
+        """
+        id_to_obj = tree.id_to_obj
+        usage_children, usage_parents, has_column_parents, has_column_children = self._build_usage_graphs(relationships, id_to_obj)
+        dashboard_roots, report_roots = self._collect_dashboard_report_roots(objects, tree)
+        contains_children = tree.contains_children
+        node_id_to_dashboard_roots: dict[Any, set[Any]] = defaultdict(set)
+        node_id_to_report_roots: dict[Any, set[Any]] = defaultdict(set)
+
+        def _add_node(oid: Any, root_id: Any, root_kind: str) -> None:
+            if root_kind == "dashboard":
+                node_id_to_dashboard_roots[oid].add(root_id)
+                node_id_to_dashboard_roots[str(oid)].add(root_id)
+            else:
+                node_id_to_report_roots[oid].add(root_id)
+                node_id_to_report_roots[str(oid)].add(root_id)
+
+        def _children_of(node: Any) -> list[Any]:
+            out: list[Any] = []
+            for m in (node, str(node)):
+                out.extend(contains_children.get(m, []))
+                out.extend(usage_children.get(m, []))
+                out.extend(has_column_children.get(m, []))
+            return out
+
+        def bfs_from_root(root_id: Any, root_kind: str) -> None:
+            seen: set[Any] = set()
+            queue: list[Any] = [root_id]
+            while queue:
+                node = queue.pop(0)
+                if node in seen:
+                    continue
+                seen.add(node)
+                seen.add(str(node))
+                _add_node(node, root_id, root_kind)
+                for child in _children_of(node):
+                    if child not in seen and str(child) not in seen:
+                        queue.append(child)
+
+        for rid in dashboard_roots:
+            bfs_from_root(rid, "dashboard")
+        for rid in report_roots:
+            bfs_from_root(rid, "report")
+        return node_id_to_dashboard_roots, node_id_to_report_roots
+
+    def _enrich_roots_from_visualization_data_items(
+        self,
+        objects: list[ExtractedObject],
+        tree: ContainmentTree,
+        node_id_to_dashboard_roots: dict[Any, set[Any]],
+        node_id_to_report_roots: dict[Any, set[Any]],
+    ) -> None:
+        """
+        Enrich node_id_to_dashboard_roots / node_id_to_report_roots using visualization data_items.
+        Dashboard -> Visualization has data_items (itemLabel, itemId, dataItemId) that reference
+        measures, dimensions, or sorts by name or path. Match those to measure/dimension/sort
+        objects and add the dashboard (or report) root to their sets so "dashboards containing"
+        counts are correct.
+        """
+        id_to_obj = tree.id_to_obj
+        dashboard_roots, report_roots = self._collect_dashboard_report_roots(objects, tree)
+        # root_id -> set of normalized strings from data_items (itemLabel, itemId, dataItemId)
+        root_to_refs: dict[Any, set[str]] = defaultdict(set)
+        for rid in dashboard_roots:
+            try:
+                descendants = tree.get_descendants(rid)
+            except Exception:
+                descendants = set()
+            for node_id in descendants:
+                obj = id_to_obj.get(node_id) or id_to_obj.get(str(node_id))
+                if not obj or not self._is_visualization_object(obj):
+                    continue
+                props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+                for di in (props.get("data_items") or []):
+                    if not isinstance(di, dict):
+                        continue
+                    for key in ("itemLabel", "itemId", "dataItemId"):
+                        v = di.get(key)
+                        if v and isinstance(v, str):
+                            root_to_refs[rid].add((v or "").strip().lower())
+        for rid in report_roots:
+            try:
+                descendants = tree.get_descendants(rid)
+            except Exception:
+                descendants = set()
+            for node_id in descendants:
+                obj = id_to_obj.get(node_id) or id_to_obj.get(str(node_id))
+                if not obj or not self._is_visualization_object(obj):
+                    continue
+                props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+                for di in (props.get("data_items") or []):
+                    if not isinstance(di, dict):
+                        continue
+                    for key in ("itemLabel", "itemId", "dataItemId"):
+                        v = di.get(key)
+                        if v and isinstance(v, str):
+                            root_to_refs[rid].add((v or "").strip().lower())
+        # Match measure/dimension/sort names to refs; add root to their sets
+        def _add_root_to_obj(oid: Any, root_id: Any, is_dashboard: bool) -> None:
+            if is_dashboard:
+                node_id_to_dashboard_roots[oid].add(root_id)
+                node_id_to_dashboard_roots[str(oid)].add(root_id)
+            else:
+                node_id_to_report_roots[oid].add(root_id)
+                node_id_to_report_roots[str(oid)].add(root_id)
+
+        def _ref_matches(refs: set[str], match_norm: str) -> bool:
+            if not match_norm:
+                return False
+            if match_norm in refs:
+                return True
+            for ref in refs:
+                if match_norm in ref or ref == match_norm:
+                    return True
+                if "." in ref and (ref.endswith("." + match_norm) or ref.split(".")[-1].strip("[]").lower() == match_norm):
+                    return True
+            return False
+
+        for obj in objects:
+            ot = _normalize_object_type(obj.object_type)
+            if ot not in ("measure", "dimension", "sort"):
+                continue
+            props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+            name_norm = ((obj.name or "").strip() or "").lower()
+            # For sorts: also match by sorted column(s). Dashboards put column refs in data_items
+            # (itemId, itemLabel, dataItemId), not sort names, so matching by column gives dashboard counts.
+            match_strings: set[str] = set()
+            if name_norm:
+                match_strings.add(name_norm)
+            if ot == "sort":
+                sorted_col = self._get_prop_any_case(props, "sorted_column", "refDataItem") or ""
+                if isinstance(sorted_col, str) and sorted_col.strip():
+                    match_strings.add(sorted_col.strip().lower())
+                for item in (props.get("sort_items") or []) if isinstance(props.get("sort_items"), list) else []:
+                    if isinstance(item, dict) and item.get("column"):
+                        col = (item.get("column") or "").strip().lower()
+                        if col:
+                            match_strings.add(col)
+            if not match_strings:
+                continue
+            for root_id, refs in root_to_refs.items():
+                is_dashboard = root_id in dashboard_roots
+                if not refs:
+                    continue
+                for match_norm in match_strings:
+                    if _ref_matches(refs, match_norm):
+                        _add_root_to_obj(obj.id, root_id, is_dashboard)
+                        break
+
     def _get_measures_breakdown(
         self,
         objects: list[ExtractedObject],
@@ -2653,36 +3504,56 @@ class ReportService:
         """
         Per-measure breakdown: name, aggregation type, parent data module, and other properties.
         Complexity is derived from the expression property.
+        Dashboards/reports containing count: BFS from dashboard/report roots via usage + has_column_children.
         """
         id_to_obj = tree.id_to_obj
-        parent_map = self._build_parent_map(relationships, id_to_obj)
-        file_container = self._file_to_container_type(objects)
-        relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
-        for rel in relationships:
-            tgt = rel.target_object_id
-            relationships_by_target[tgt].append(rel.source_object_id)
-            if str(tgt) != tgt:
-                relationships_by_target[str(tgt)] = relationships_by_target[tgt]
-        
+        parent_map = self._build_parent_map(relationships, id_to_obj, getattr(tree, "canonical_ids", None))
+        node_id_to_dashboard_roots, node_id_to_report_roots = self._build_node_id_to_roots_for_leaf_objects(objects, tree, relationships)
+        self._enrich_roots_from_visualization_data_items(objects, tree, node_id_to_dashboard_roots, node_id_to_report_roots)
+
+        def _roots_for(oid: Any) -> tuple[int, int, Any, Any]:
+            dash = node_id_to_dashboard_roots.get(oid) or node_id_to_dashboard_roots.get(str(oid), set())
+            rep = node_id_to_report_roots.get(oid) or node_id_to_report_roots.get(str(oid), set())
+            dash_key = next(iter(dash), None) if dash else None
+            rep_key = next(iter(rep), None) if rep else None
+            return len(dash), len(rep), dash_key, rep_key
+
         tracker = ComplexityTracker()
         items: list[dict[str, Any]] = []
-        
+
         for obj in objects:
             if _normalize_object_type(obj.object_type) != "measure":
                 continue
             props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
-            agg = props.get("regularAggregate") or props.get("aggregation") or ""
+            # Exclude misclassified dimensions: data_usage dimension/attribute, or simple [M].[T].[C] with no aggregation
+            data_usage = (props.get("data_usage") or props.get("usage") or "").strip().lower()
+            if data_usage in ("dimension", "attribute"):
+                continue
+            agg = props.get("regularAggregate") or props.get("aggregation") or props.get("aggregate") or ""
+            agg_lower = (agg or "").strip().lower()
+            no_agg = agg_lower in ("", "none")
+            # Expression may be under expression, formula, or calculation (e.g. from report spec)
+            expr = self._get_prop_any_case(props, "expression", "formula", "calculation") or ""
+            if _expression_is_simple_column_reference(expr) and no_agg:
+                continue
+            # Name-based fallback: well-known dimension columns (e.g. Postal_Code, Segment, Category) with no aggregation
+            obj_name = (getattr(obj, "name", None) or "").strip()
+            if no_agg and _name_looks_like_dimension(obj_name):
+                continue
+            # Exclude from measures when expression is a calculated field (e.g. average(, extract() — belong in calculated fields)
+            if _expression_looks_like_calculated_field(expr):
+                continue
             is_simple = (agg or "").lower() in ("", "none", "none ")
             is_complex = not is_simple
             module_id, module_name = self._get_parent_module_id(obj.id, parent_map, id_to_obj)
-            
-            dashboards_count, reports_count, dash_root_key, report_root_key = self._resolve_containment_root(
-                obj, tree, file_container, relationships_by_target
-            )
+
+            dashboards_count, reports_count, dash_root_key, report_root_key = _roots_for(obj.id)
             
             extra = self._safe_props(props, ["cognosClass", "regularAggregate", "datatype", "usage", "expression"], preview_len=300)
             expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
-            complexity = self._calculated_field_complexity("expression", expression_raw)
+            datatype = self._get_prop_any_case(props, "datatype", "data_type")
+            obj_name = (getattr(obj, "name", None) or "").strip() or None
+            complexity = self._calculated_field_complexity("expression", expression_raw, datatype, obj_name)
             tracker.add(complexity, dash_root_key, report_root_key)
             
             items.append({
@@ -2697,16 +3568,31 @@ class ReportService:
                 "complexity": complexity,
                 "dashboards_containing_count": dashboards_count,
                 "reports_containing_count": reports_count,
+                "dash_root_key": dash_root_key,
+                "report_root_key": report_root_key,
             })
 
-        # items having the same name, aggregation, and expression should be grouped together
+        # items having the same name, aggregation, and expression should be grouped together.
+        # Rebuild by_complexity from grouped items so complexity analysis counts match inventory.
         group_key_to_items: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
         for it in items:
             key = (it["name"], it["aggregation"], it.get("expression", ""))
             group_key_to_items[key].append(it)
         grouped: list[dict[str, Any]] = []
+        grouped_tracker = ComplexityTracker()
         for group in group_key_to_items.values():
             first = group[0]
+            dash_roots = set()
+            report_roots = set()
+            for x in group:
+                dk = x.get("dash_root_key")
+                if dk is not None:
+                    dash_roots.add(dk)
+                rk = x.get("report_root_key")
+                if rk is not None:
+                    report_roots.add(rk)
+            merged_complexity = max((x.get("complexity") or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first.get("complexity")
+            grouped_tracker.add_item_with_roots(merged_complexity, dash_roots, report_roots)
             merged = {
                 "measure_id": first["measure_id"],
                 "measure_ids": [x["measure_id"] for x in group],
@@ -2716,21 +3602,21 @@ class ReportService:
                 "is_complex": first["is_complex"],
                 "parent_module_id": first["parent_module_id"],
                 "parent_module_name": first["parent_module_name"],
-                "complexity": max((x["complexity"] or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first["complexity"],
+                "complexity": merged_complexity,
                 "dashboards_containing_count": max(x["dashboards_containing_count"] for x in group),
                 "reports_containing_count": max(x["reports_containing_count"] for x in group),
             }
             for k, v in first.items():
-                if k not in ("measure_id", "name", "aggregation", "is_simple", "is_complex", "parent_module_id", "parent_module_name", "complexity", "dashboards_containing_count", "reports_containing_count"):
+                if k not in ("measure_id", "name", "aggregation", "is_simple", "is_complex", "parent_module_id", "parent_module_name", "complexity", "dashboards_containing_count", "reports_containing_count", "dash_root_key", "report_root_key"):
                     merged[k] = v
             grouped.append(merged)
         items = grouped
 
         _stats = _build_complexity_stats(items)
-        by_complexity = tracker.build_by_complexity("measure_count")
+        by_complexity = grouped_tracker.build_by_complexity("measure_count")
         overall_complexity = _overall_complexity_linear(_stats)
         dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
-            tracker.dash_roots, tracker.report_roots
+            grouped_tracker.dash_roots, grouped_tracker.report_roots
         )
         return {
             "total_measures": len(items),
@@ -2754,36 +3640,50 @@ class ReportService:
         """
         Per-dimension breakdown: name, parent data module, and other properties.
         Complexity is derived from the expression property.
+        Dashboards/reports containing count: BFS from dashboard/report roots via usage + has_column_children.
         """
         id_to_obj = tree.id_to_obj
-        parent_map = self._build_parent_map(relationships, id_to_obj)
-        file_container = self._file_to_container_type(objects)
-        relationships_by_target: dict[Any, list[Any]] = defaultdict(list)
-        for rel in relationships:
-            tgt = rel.target_object_id
-            relationships_by_target[tgt].append(rel.source_object_id)
-            if str(tgt) != tgt:
-                relationships_by_target[str(tgt)] = relationships_by_target[tgt]
-        
+        parent_map = self._build_parent_map(relationships, id_to_obj, getattr(tree, "canonical_ids", None))
+        node_id_to_dashboard_roots, node_id_to_report_roots = self._build_node_id_to_roots_for_leaf_objects(objects, tree, relationships)
+        self._enrich_roots_from_visualization_data_items(objects, tree, node_id_to_dashboard_roots, node_id_to_report_roots)
+
+        def _roots_for(oid: Any) -> tuple[int, int, Any, Any]:
+            dash = node_id_to_dashboard_roots.get(oid) or node_id_to_dashboard_roots.get(str(oid), set())
+            rep = node_id_to_report_roots.get(oid) or node_id_to_report_roots.get(str(oid), set())
+            dash_key = next(iter(dash), None) if dash else None
+            rep_key = next(iter(rep), None) if rep else None
+            return len(dash), len(rep), dash_key, rep_key
+
         tracker = ComplexityTracker()
         items: list[dict[str, Any]] = []
-        
+
         for obj in objects:
             if _normalize_object_type(obj.object_type) != "dimension":
                 continue
             props = (obj.properties or {}) if isinstance(obj.properties, dict) else {}
+            # Exclude misclassified measures: data_usage measure or aggregation set
+            data_usage = (props.get("data_usage") or props.get("usage") or "").strip().lower()
+            agg = (props.get("regularAggregate") or props.get("aggregation") or props.get("aggregate") or "").strip().lower()
+            if data_usage == "measure" or agg not in ("", "none"):
+                continue
+            # Exclude calculated fields that were classified as dimension: extract, substring_regex, _days_to_end_of_month,
+            # any other function call (non-aggregate), or name starting with _ (Cognos convention).
+            expr = self._get_prop_any_case(props, "expression", "formula", "calculation") or ""
+            obj_name = (getattr(obj, "name", None) or "").strip()
+            if _expression_looks_like_calculated_field(expr) or _name_looks_like_calculated_field(obj_name):
+                continue
             usage = props.get("usage") or props.get("data_usage") or ""
             is_simple = (usage or "").lower() in ("attribute", "dimension", "")
             is_complex = not is_simple
             module_id, module_name = self._get_parent_module_id(obj.id, parent_map, id_to_obj)
-            
-            dashboards_count, reports_count, dash_root_key, report_root_key = self._resolve_containment_root(
-                obj, tree, file_container, relationships_by_target
-            )
+
+            dashboards_count, reports_count, dash_root_key, report_root_key = _roots_for(obj.id)
             
             extra = self._safe_props(props, ["cognosClass", "usage", "datatype", "expression"], preview_len=300)
             expression_raw = self._get_prop_any_case(props, "expression", "formula", "calculation")
-            complexity = self._calculated_field_complexity("expression", expression_raw)
+            datatype = self._get_prop_any_case(props, "datatype", "data_type")
+            obj_name = (getattr(obj, "name", None) or "").strip() or None
+            complexity = self._calculated_field_complexity("expression", expression_raw, datatype, obj_name)
             tracker.add(complexity, dash_root_key, report_root_key)
             
             items.append({
@@ -2798,17 +3698,31 @@ class ReportService:
                 "complexity": complexity,
                 "dashboards_containing_count": dashboards_count,
                 "reports_containing_count": reports_count,
+                "dash_root_key": dash_root_key,
+                "report_root_key": report_root_key,
             })
 
-        
-        # items having the same name, usage, and expression should be grouped together
+        # items having the same name, usage, and expression should be grouped together.
+        # Rebuild by_complexity from grouped items so complexity analysis counts match inventory.
         group_key_to_items: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
         for it in items:
             key = (it["name"], it.get("usage"), it.get("expression", ""))
             group_key_to_items[key].append(it)
         grouped: list[dict[str, Any]] = []
+        grouped_tracker = ComplexityTracker()
         for group in group_key_to_items.values():
             first = group[0]
+            dash_roots = set()
+            report_roots = set()
+            for x in group:
+                dk = x.get("dash_root_key")
+                if dk is not None:
+                    dash_roots.add(dk)
+                rk = x.get("report_root_key")
+                if rk is not None:
+                    report_roots.add(rk)
+            merged_complexity = max((x.get("complexity") or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first.get("complexity")
+            grouped_tracker.add_item_with_roots(merged_complexity, dash_roots, report_roots)
             merged = {
                 "dimension_id": first["dimension_id"],
                 "dimension_ids": [x["dimension_id"] for x in group],
@@ -2818,21 +3732,21 @@ class ReportService:
                 "is_complex": first["is_complex"],
                 "parent_module_id": first["parent_module_id"],
                 "parent_module_name": first["parent_module_name"],
-                "complexity": max((x["complexity"] or "" for x in group), key=lambda c: COMPLEXITY_LEVELS.index(c) if c in COMPLEXITY_LEVELS else -1) or first["complexity"],
+                "complexity": merged_complexity,
                 "dashboards_containing_count": max(x["dashboards_containing_count"] for x in group),
                 "reports_containing_count": max(x["reports_containing_count"] for x in group),
             }
             for k, v in first.items():
-                if k not in ("dimension_id", "name", "usage", "is_simple", "is_complex", "parent_module_id", "parent_module_name", "complexity", "dashboards_containing_count", "reports_containing_count"):
+                if k not in ("dimension_id", "name", "usage", "is_simple", "is_complex", "parent_module_id", "parent_module_name", "complexity", "dashboards_containing_count", "reports_containing_count", "dash_root_key", "report_root_key"):
                     merged[k] = v
             grouped.append(merged)
         items = grouped
 
         _stats = _build_complexity_stats(items)
-        by_complexity = tracker.build_by_complexity("dimension_count")
+        by_complexity = grouped_tracker.build_by_complexity("dimension_count")
         overall_complexity = _overall_complexity_linear(_stats)
         dashboards_containing_any_count, reports_containing_any_count = _union_root_counts(
-            tracker.dash_roots, tracker.report_roots
+            grouped_tracker.dash_roots, grouped_tracker.report_roots
         )
         return {
             "total_dimensions": len(items),

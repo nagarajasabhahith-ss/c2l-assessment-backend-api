@@ -147,10 +147,32 @@ class ParserService:
             
             source_id_to_db_id[obj.object_id] = db_obj.id
 
+        # Map storeID -> db_id so USES(dashboard, storeID) can be persisted as USES(dashboard, data_module)
+        # Include ALL assessment objects (from DB) so cross-file USES (e.g. dashboard in file1, data_module in file2) resolve
+        store_id_to_db_id = {}
+        for obj in result.objects:
+            props = getattr(obj, "properties", None) or {}
+            if isinstance(props, dict):
+                sid = props.get("storeID") or props.get("store_id")
+                if sid and str(sid).strip():
+                    oid = source_id_to_db_id.get(obj.object_id)
+                    if oid is not None:
+                        store_id_to_db_id[str(sid).strip()] = oid
+        # Merge with storeIDs from all objects already in this assessment (cross-file resolution)
+        for db_obj in self.db.query(ExtractedObject).filter(ExtractedObject.assessment_id == assessment_id).all():
+            props = db_obj.properties or {}
+            if isinstance(props, dict):
+                sid = props.get("storeID") or props.get("store_id")
+                if sid and str(sid).strip():
+                    store_id_to_db_id[str(sid).strip()] = db_obj.id
+
         # 2. Save Relationships
         for rel in result.relationships:
             source_db_id = source_id_to_db_id.get(rel.source_id)
             target_db_id = source_id_to_db_id.get(rel.target_id)
+            # USES/CONNECTS_TO often target storeID (no object id); resolve to data_module db id
+            if target_db_id is None and rel.target_id is not None:
+                target_db_id = store_id_to_db_id.get(str(rel.target_id).strip())
             
             if source_db_id and target_db_id:
                 db_rel = ObjectRelationship(
